@@ -6,7 +6,9 @@ on:
       account_id:
         description: 'The UUID of the Wallester Account'
         required: true
-        default: '06691820-662d-43e9-9ac3-29b61d1476d7'
+      person_id:
+        description: 'The UUID of the Person (Cardholder)'
+        required: true
 
 jobs:
   issue-virtual-card:
@@ -29,69 +31,47 @@ jobs:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
+          PERSON_ID: ${{ github.event.inputs.person_id }}
         run: |
           import os, time, jwt, requests, sys, uuid, base64
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Decode Private Key
-          api_key = os.getenv("API_KEY")
-          b64_key = os.getenv("B64_PRIVATE_KEY", "")
-          account_id = os.getenv("ACCOUNT_ID")
-
+          # 1. Decode Key
           try:
+              b64_key = os.getenv("B64_PRIVATE_KEY", "")
               decoded_pem = base64.b64decode(b64_key).decode('utf-8').strip()
-              private_key_obj = serialization.load_pem_private_key(
-                  decoded_pem.encode('utf-8'),
-                  password=None
-              )
+              private_key_obj = serialization.load_pem_private_key(decoded_pem.encode('utf-8'), password=None)
           except Exception as e:
-              print(f"❌ Key Loading Failed: {e}")
+              print(f"❌ Key Error: {e}")
               sys.exit(1)
 
-          # 2. Generate JWT (Strict 5-second window)
-          timestamp = int(time.time())
-          try:
-              token = jwt.encode(
-                  {"api_key": api_key, "ts": timestamp}, 
-                  private_key_obj, 
-                  algorithm="RS256"
-              )
-          except Exception as e:
-              print(f"❌ JWT Signing Failed: {e}")
-              sys.exit(1)
+          # 2. JWT (5s window)
+          token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key_obj, algorithm="RS256")
 
-          # 3. Corrected API Request for Wallester Business
-          # The card is a sub-resource of the account
-          url = f"https://api-frontend.wallester.com/v1/accounts/{account_id}/cards"
+          # 3. Correct v1 Business Endpoint
+          # In v1, issuance is a top-level POST to /cards
+          url = "https://api-frontend.wallester.com/v1/cards"
           
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
-              "X-Request-ID": str(uuid.uuid4()),
-              "User-Agent": "Wallester-GitHub-Action/1.5"
+              "X-Request-ID": str(uuid.uuid4())
           }
           
-          # Standard payload for virtual business card issuance
           body = {
+              "account_id": os.getenv("ACCOUNT_ID"),
+              "person_id": os.getenv("PERSON_ID"),
               "type": "Virtual",
               "currency_code": "EUR",
-              "description": "Card issued via GitHub Actions"
+              "description": "GH Action Issuance"
           }
 
-          print(f"🚀 Issuing card to Account: {account_id}")
-          print(f"🔗 URL: {url}")
-          
-          try:
-              response = requests.post(url, json=body, headers=headers, timeout=15)
-              if response.status_code in [200, 201]:
-                  print("✅ Success! Card issued.")
-                  print(response.json())
-              else:
-                  print(f"❌ Error {response.status_code}: {response.text}")
-                  # If 404, the account_id might be wrong or the API version moved
-                  if response.status_code == 404:
-                      print("💡 Tip: Check if the Account ID is correct and active in the portal.")
-                  sys.exit(1)
-          except Exception as e:
-              print(f"❌ Request Failed: {e}")
+          print(f"🚀 POSTing to {url}")
+          response = requests.post(url, json=body, headers=headers, timeout=15)
+
+          if response.status_code in [200, 201]:
+              print("✅ Success!")
+              print(response.json())
+          else:
+              print(f"❌ Failed {response.status_code}: {response.text}")
               sys.exit(1)
