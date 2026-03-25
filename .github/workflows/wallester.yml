@@ -1,10 +1,10 @@
-name: Wallester Deep Inspection
+name: Wallester Final Fix & Debug
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug-api:
+  debug-and-reveal:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -13,33 +13,72 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-          run: pip install PyJWT cryptography requests
+        run: pip install PyJWT cryptography requests
 
-      - name: Full JSON Dump
+      - name: Execute Deep Inspection
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
+          TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid, json
-          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives import serialization, hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
 
-          # 1. Auth
-          CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
-          pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
-          private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-          token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
-          
-          # 2. Fetch with ALL possible headers
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "X-Request-ID": str(uuid.uuid4()),
-              "Accept": "application/json"
+          # 1. Setup Keys & Derive Public Key
+          try:
+              pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
+              private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
+              pub_pem = private_key.public_key().public_bytes(
+                  encoding=serialization.Encoding.PEM,
+                  format=serialization.PublicFormat.SubjectPublicKeyInfo
+              )
+              pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
+          except Exception as e:
+              print(f"❌ Key Error: {e}"); sys.exit(1)
+
+          def get_headers():
+              token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
+              return {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": str(uuid.uuid4())}
+
+          # 2. Issue a NEW card to test the RSA handshake with Email 3DS
+          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
+          issue_body = {
+              "account_id": ACCOUNT_ID,
+              "type": "Virtual",
+              "currency_code": "EUR",
+              "public_key": pub_b64,
+              "3d_secure_settings": {
+                  "email": "goldenkumquats@gmail.com",
+                  "password": os.getenv("TDS_PASSWORD"),
+                  "out_of_band_enabled": False
+              }
           }
+
+          print("🚀 Attempting Card Issuance...")
+          res = requests.post("https://api-frontend.wallester.com/v1/cards", json=issue_body, headers=get_headers())
           
-          # We try the GET /v1/cards/{id} but check EVERY field
-          res = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers)
-          
-          print("--- FULL API RESPONSE KEYS ---")
-          print(json.dumps(res.json(), indent=2))
-          print("------------------------------")
+          if res.status_code in [200, 201]:
+              data = res.json()
+              print(f"✅ Card Created: {data.get('card', {}).get('id')}")
+              
+              # Check for encrypted data
+              enc_data = data.get('encrypted_data')
+              if enc_data:
+                  print("🔐 Sensitive data found! Decrypting...")
+                  try:
+                      decrypted = private_key.decrypt(
+                          base64.b64decode(enc_data),
+                          padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                      )
+                      print(f"💎 DATA: {decrypted.decode('utf-8')}")
+                  except Exception as d_err:
+                      print(f"❌ Decryption failed: {d_err}")
+              else:
+                  print("\n⚠️  STRUCTURE ANALYSIS:")
+                  print("The 'encrypted_data' field is MISSING from the response.")
+                  print("Current Keys in JSON:", list(data.keys()))
+                  print("\nPROBABLE CAUSE: Your API Key does not have 'Show Card Details' scope enabled.")
+          else:
+              print(f"❌ API Error: {res.text}")
