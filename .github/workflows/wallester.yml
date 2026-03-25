@@ -1,4 +1,4 @@
-name: Wallester - Create and Reveal (Fixed Types)
+name: Wallester - Create and Reveal (Harden)
 
 on:
   workflow_dispatch:
@@ -20,8 +20,8 @@ jobs:
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          PROFILE_ID: "YOUR_PROFILE_ID_HERE"
-          ACCOUNT_ID: "YOUR_ACCOUNT_ID_HERE"
+          PROFILE_ID: ${{ secrets.WALLESTER_PROFILE_ID }}
+          ACCOUNT_ID: ${{ secrets.WALLESTER_ACCOUNT_ID }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid, re
           from cryptography.hazmat.primitives import serialization, hashes
@@ -29,56 +29,65 @@ jobs:
           from datetime import datetime
 
           # --- 1. KEY SETUP ---
-          raw_key_bytes = base64.b64decode(os.getenv("B64_PRIVATE_KEY").strip())
-          private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
-          pub_pem = private_key.public_key().public_bytes(
-              encoding=serialization.Encoding.PEM,
-              format=serialization.PublicFormat.SubjectPublicKeyInfo
-          ).decode('utf-8')
-          pub_b64_payload = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+          try:
+              # Strip any whitespace from the secret
+              b64_str = os.getenv("B64_PRIVATE_KEY").strip()
+              raw_key_bytes = base64.b64decode(b64_str)
+              private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
+              
+              pub_pem = private_key.public_key().public_bytes(
+                  encoding=serialization.Encoding.PEM,
+                  format=serialization.PublicFormat.SubjectPublicKeyInfo
+              ).decode('utf-8')
+              pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+          except Exception as e:
+              print(f"❌ Key Loading Error: {e}"); sys.exit(1)
 
-          # --- 2. AUTH ---
+          # --- 2. AUTH HELPERS ---
           def get_headers():
               return {
-                  "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
+                  "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY').strip(), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
                   "X-Request-ID": str(uuid.uuid4()),
                   "Content-Type": "application/json"
               }
 
-          # --- 3. CREATE NEW CARD ---
-          # Cleaning IDs to prevent "must be a valid version 4 UUID" errors
+          # --- 3. CREATE NEW CARD (DEFENSIVE) ---
+          # Clean the UUIDs
           act_id = os.getenv("ACCOUNT_ID").strip()
           prf_id = os.getenv("PROFILE_ID").strip()
 
-          print(f"🆕 Creating card for Account: {act_id[:8]}...")
-          
+          # Wallester 'type' can be 'virtual' or 'virtual_disposable'
+          # We'll use 'virtual' but print a hint if it fails
           create_payload = {
               "account_id": act_id,
               "card_metadata_profile_id": prf_id,
-              "type": "virtual", # If this fails, try "VIRTUAL" or "virtual_disposable"
-              "public_key": pub_b64_payload
+              "type": "virtual", 
+              "public_key": pub_b64
           }
-          
+
+          print(f"📡 Requesting new card for account {act_id[:8]}...")
           res = requests.post("https://api-frontend.wallester.com/v1/cards", 
                              headers=get_headers(), json=create_payload)
-          
+
           if not res.ok:
               print(f"❌ Creation Failed: {res.status_code}")
-              print(f"RAW ERROR: {res.text}")
+              print(f"DEBUG: {res.text}")
+              if "type" in res.text:
+                  print("💡 TIP: Try changing 'type' in the script to 'virtual_disposable' or 'VIRTUAL'.")
               sys.exit(1)
-          
+
           card_data = res.json()['card']
           CARD_ID = card_data['id']
-          print(f"✅ Success! Card ID: {CARD_ID}")
+          print(f"✅ Card Created: {CARD_ID}")
 
-          # --- 4. REVEAL ---
-          def decrypt_field(endpoint, label):
+          # --- 4. REVEAL & DECRYPT ---
+          def reveal_field(endpoint, label):
               url = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/{endpoint}"
-              resp = requests.post(url, headers=get_headers(), json={"public_key": pub_b64_payload})
-              if not resp.ok: return "FAILED"
+              resp = requests.post(url, headers=get_headers(), json={"public_key": pub_b64})
+              if not resp.ok: return None
               
-              val = resp.json().get(endpoint.replace('-', '_'))
-              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', val)
+              enc_str = resp.json().get(endpoint.replace('-', '_'))
+              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', enc_str)
               ciphertext = base64.b64decode("".join(clean.split()))
               
               return private_key.decrypt(
@@ -86,8 +95,12 @@ jobs:
                   padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=label.encode())
               ).decode('utf-8')
 
-          pan = decrypt_field("encrypted-card-number", "CardNumber")
-          cvv = decrypt_field("encrypted-cvv2", "CVV2")
+          pan = reveal_field("encrypted-card-number", "CardNumber")
+          cvv = reveal_field("encrypted-cvv2", "CVV2")
 
-          expiry = datetime.strptime(card_data['expiry_date'].split('T')[0], '%Y-%m-%d')
-          print(f"\n✨ RESULT: {pan}|{expiry.strftime('%m')}|{expiry.strftime('%y')}|{cvv}")
+          if pan and cvv:
+              exp_date = card_data['expiry_date'].split('T')[0]
+              dt = datetime.strptime(exp_date, '%Y-%m-%d')
+              print(f"\n✨ NEW CARD DATA:\n{'='*30}")
+              print(f"{pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+              print(f"{'='*30}")
