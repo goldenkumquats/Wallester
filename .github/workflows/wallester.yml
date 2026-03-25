@@ -1,4 +1,4 @@
-name: Wallester Issue & Reveal (Email 3DS)
+name: Wallester Final Fix (Email 3DS + Decryption)
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
 
-          # 1. Key Derivation
+          # 1. Prepare Keys
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
@@ -38,7 +38,7 @@ jobs:
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          # 2. Request Setup
+          # 2. API Setup
           ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
           token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
           
@@ -48,6 +48,7 @@ jobs:
               "X-Request-ID": str(uuid.uuid4())
           }
 
+          # Force Email 3DS by disabling 'out_of_band'
           body = {
               "account_id": ACCOUNT_ID,
               "type": "Virtual",
@@ -55,34 +56,44 @@ jobs:
               "public_key": pub_b64,
               "3d_secure_settings": {
                   "email": "goldenkumquats@gmail.com",
-                  "password": os.getenv("TDS_PASSWORD"),
-                  "out_of_band_enabled": False # Disabling 'App' push to force Email/OTP
-              },
-              "security": {
-                  "internet_purchase_enabled": True,
-                  "contactless_enabled": True,
-                  "withdrawal_enabled": True
+                  "password": os.getenv("TDS_PASSWORD"), # Required for Email 3DS
+                  "out_of_band_enabled": False           # Forces Email flow
               }
           }
 
           # 3. Execution
-          print("🚀 Issuing Card (Forcing Email 3DS)...")
+          print("🚀 Issuing Card & Requesting Encrypted Data...")
           res = requests.post("https://api-frontend.wallester.com/v1/cards", json=body, headers=headers)
 
           if res.status_code in [200, 201]:
               data = res.json()
               print(f"✅ Card Created: {data.get('card', {}).get('id')}")
               
+              # Wallester usually returns 'encrypted_data' as a single block 
+              # containing both PAN and CVV.
               enc_data = data.get('encrypted_data')
               if enc_data:
-                  print("🔐 Decrypting Data...")
-                  decrypted = private_key.decrypt(
-                      base64.b64decode(enc_data),
-                      padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-                  )
-                  print(f"💎 DETAILS: {decrypted.decode('utf-8')}")
+                  print("🔐 Decrypting Sensitive Data...")
+                  try:
+                      # CRITICAL: Wallester often uses a label for the RSA-OAEP padding
+                      # We try with label=b"CardNumber" first, then label=None
+                      for label_val in [b"CardNumber", None]:
+                          try:
+                              decrypted = private_key.decrypt(
+                                  base64.b64decode(enc_data),
+                                  padding.OAEP(
+                                      mgf=padding.MGF1(hashes.SHA256()), 
+                                      algorithm=hashes.SHA256(), 
+                                      label=label_val
+                                  )
+                              )
+                              print(f"💎 DECRYPTED: {decrypted.decode('utf-8')}")
+                              break
+                          except:
+                              continue
+                  except Exception as decrypt_err:
+                      print(f"❌ Decryption Failed. Check key match.")
               else:
-                  print("⚠️ Permission Denied: API Key cannot 'View Sensitive Data'.")
-                  print("Go to Wallester Portal > API Keys > Edit > Enable 'View Sensitive Data'.")
+                  print("⚠️ No encrypted_data. Your API user role must be 'Admin' or 'Developer' with 'Card Details' access.")
           else:
-              print(f"❌ Error {res.status_code}: {res.text}")
+              print(f"❌ API Error: {res.text}")
