@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       account_id:
-        description: 'The UUID of the Account to link'
+        description: 'The UUID of the Wallester Account'
         required: true
-        default: '06691820-662d-43e9-9ac3-29b61d1476d7'
+      person_id:
+        description: 'The UUID of the Person (Cardholder)'
+        required: true
 
 jobs:
   issue-card:
@@ -26,49 +28,70 @@ jobs:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
+          PERSON_ID: ${{ github.event.inputs.person_id }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Load Keys
+          # 1. Load and Decode Private Key
           try:
               b64_key = os.getenv("B64_PRIVATE_KEY", "")
               pem_data = base64.b64decode(b64_key).decode('utf-8').strip()
-              private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
+              private_key = serialization.load_pem_private_key(
+                  pem_data.encode('utf-8'), 
+                  password=None
+              )
           except Exception as e:
-              print(f"❌ Key Error: {e}"); sys.exit(1)
+              print(f"❌ Key Error: {e}")
+              sys.exit(1)
 
-          # 2. JWT Token (api_key + ts)
-          # Generated 5s before request per docs
+          # 2. Generate JWT (Claims: api_key, ts)
+          # Strict 5-second window per Wallester documentation
           token = jwt.encode(
-              {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, 
+              {
+                  "api_key": os.getenv("API_KEY"), 
+                  "ts": int(time.time())
+              }, 
               private_key, 
               algorithm="RS256"
           )
 
           # 3. Request Execution
+          # Endpoint for Wallester Business v1 Card Issuance
           url = "https://api-frontend.wallester.com/v1/cards"
+          
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
-              "X-Request-ID": str(uuid.uuid4()) # Mandatory for tracking
+              "X-Request-ID": str(uuid.uuid4())
           }
           
-          # Minimal body for a Virtual Card issuance
+          # Faithful Body including mandatory 3DS settings to resolve 422
           body = {
               "account_id": os.getenv("ACCOUNT_ID"),
+              "person_id": os.getenv("PERSON_ID"),
               "type": "Virtual",
               "currency_code": "EUR",
-              "description": "Hello World Card"
+              "description": "GH Action Hello World",
+              "card_3d_secure_settings": {
+                  "is_enabled": True,
+                  "type": "Default"
+              }
           }
 
           print(f"🚀 POST {url}")
-          response = requests.post(url, json=body, headers=headers)
-
-          if response.status_code in [200, 201]:
-              print("✅ Success!")
-              print(response.json())
-          else:
-              print(f"❌ Failed: {response.status_code}")
-              print(response.text)
+          print(f"📦 Payload: {body}")
+          
+          try:
+              response = requests.post(url, json=body, headers=headers, timeout=15)
+              
+              if response.status_code in [200, 201]:
+                  print("✅ Success! Card Issued.")
+                  print(response.json())
+              else:
+                  print(f"❌ Failed: {response.status_code}")
+                  print(f"Response Body: {response.text}")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ Request Error: {e}")
               sys.exit(1)
