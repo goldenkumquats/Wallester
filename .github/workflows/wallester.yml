@@ -1,4 +1,4 @@
-name: Wallester - Issue and Reveal
+name: Wallester - Issue and Reveal (Verbose)
 on:
   workflow_dispatch:
 
@@ -29,21 +29,22 @@ jobs:
           API_URL = "https://api-frontend.wallester.com/v1/cards"
           EMAIL = "goldenkumquats@gmail.com"
 
+          print("--- 🛠️  DEBUG: Starting Key Setup ---")
           try:
               b64_key = os.getenv("B64_PRIVATE_KEY", "")
               raw_key_bytes = base64.b64decode(b64_key)
               private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
               
-              # Derive Public Key for decryption requests
               pub_pem = private_key.public_key().public_bytes(
                   encoding=serialization.Encoding.PEM,
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
               ).decode('utf-8')
               pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+              print("✅ Key Setup Successful")
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          # 2. Authentication & Headers
+          # 2. Authentication
           token = jwt.encode(
               {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, 
               private_key, 
@@ -72,27 +73,48 @@ jobs:
               }
           }
 
-          print(f"🚀 Issuing Card...")
+          print(f"\n🚀 Issuing Card to Account: {ACCOUNT_ID}...")
           res_issue = requests.post(url=API_URL, json=body_issue, headers=headers, timeout=15)
+          
+          print(f"--- 🛠️  DEBUG: Issuance Response (Status: {res_issue.status_code}) ---")
+          issue_json = res_issue.json()
+          print(json.dumps(issue_json, indent=2))
           
           if res_issue.status_code not in [200, 201]:
               print(f"❌ Issuance Failed: {res_issue.text}"); sys.exit(1)
           
-          CARD_ID = res_issue.json().get('id')
-          print(f"✅ Card Issued: {CARD_ID}")
+          CARD_ID = issue_json.get('id')
+          if not CARD_ID:
+              # Fallback: check if it's nested under a 'card' object
+              CARD_ID = issue_json.get('card', {}).get('id')
+
+          print(f"✅ Card ID identified: {CARD_ID}")
 
           # 4. API Calls for Sensitive Data
+          print(f"\n🔓 Requesting decryption for Card ID: {CARD_ID}...")
           body_reveal = {"public_key": pub_b64}
           
-          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers).json()
-          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body_reveal).json()
-          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body_reveal).json()
+          res_m_raw = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers)
+          res_p_raw = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body_reveal)
+          res_c_raw = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body_reveal)
 
-          def exhaustive_decrypt(data, possible_labels):
-              if not data: return None
+          res_m = res_m_raw.json()
+          res_p = res_p_raw.json()
+          res_c = res_c_raw.json()
+
+          print(f"--- 🛠️  DEBUG: Reveal API Status Codes ---")
+          print(f"Metadata: {res_m_raw.status_code}, PAN: {res_p_raw.status_code}, CVV: {res_c_raw.status_code}")
+
+          def exhaustive_decrypt(data, label_name, possible_labels):
+              if not data: 
+                  print(f"⚠️  No data found for {label_name}")
+                  return None
+              
+              print(f"--- 🛠️  DEBUG: Attempting Decryption for {label_name} ---")
               clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', data)
               clean = "".join(clean.split())
               ciphertext = base64.b64decode(clean)
+              
               for mgf_alg in [hashes.SHA256(), hashes.SHA1()]:
                   for lbl in possible_labels:
                       try:
@@ -104,20 +126,28 @@ jobs:
                                   label=lbl.encode()
                               )
                           )
-                          return decrypted.decode('utf-8')
-                      except:
+                          val = decrypted.decode('utf-8')
+                          print(f"✅ Decrypted {label_name} using label: {lbl}")
+                          return val
+                      except Exception:
                           continue
               return None
 
           # 5. Decrypt & Final Output
-          pan = exhaustive_decrypt(res_p.get('encrypted_card_number'), ["CardNumber"])
-          cvv = exhaustive_decrypt(res_c.get('encrypted_cvv2'), ["CVV", "CVV2", "Cvv"])
+          pan = exhaustive_decrypt(res_p.get('encrypted_card_number'), "PAN", ["CardNumber"])
+          cvv = exhaustive_decrypt(res_c.get('encrypted_cvv2'), "CVV", ["CVV", "CVV2", "Cvv"])
 
           if pan and cvv:
-              exp = res_m.get('card', {}).get('expiry_date', "2000-01-01")
+              # Metadata nesting can vary; check for card object
+              card_meta = res_m.get('card', res_m)
+              exp = card_meta.get('expiry_date', "2000-01-01")
               dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
+              
               print(f"\n✅ SUCCESS\n{'='*40}")
               print(f"RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
               print(f"{'='*40}")
           else:
-              print(f"❌ Partial Success. PAN: {pan}, CVV: {cvv}")
+              print(f"\n❌ Final Reveal Failed.")
+              print(f"PAN Result: {'Found' if pan else 'None'}")
+              print(f"CVV Result: {'Found' if cvv else 'None'}")
+              print(f"Full Metadata Response: {json.dumps(res_m, indent=2)}")
