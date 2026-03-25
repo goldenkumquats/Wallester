@@ -2,13 +2,6 @@ name: Wallester Card Issuance HelloWorld
 
 on:
   workflow_dispatch:
-    inputs:
-      account_id:
-        description: 'The UUID of the Wallester Account'
-        required: true
-      person_id:
-        description: 'The UUID of the Person (Cardholder)'
-        required: true
 
 jobs:
   issue-card:
@@ -27,13 +20,15 @@ jobs:
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          ACCOUNT_ID: ${{ github.event.inputs.account_id }}
-          PERSON_ID: ${{ github.event.inputs.person_id }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Load and Decode Private Key
+          # 1. Setup Constants
+          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
+          API_URL = "https://api-frontend.wallester.com/v1/cards"
+
+          # 2. Load and Decode Private Key
           try:
               b64_key = os.getenv("B64_PRIVATE_KEY", "")
               pem_data = base64.b64decode(b64_key).decode('utf-8').strip()
@@ -45,8 +40,7 @@ jobs:
               print(f"❌ Key Error: {e}")
               sys.exit(1)
 
-          # 2. Generate JWT (Claims: api_key, ts)
-          # Strict 5-second window per Wallester documentation
+          # 3. Generate JWT (Claims: api_key, ts)
           token = jwt.encode(
               {
                   "api_key": os.getenv("API_KEY"), 
@@ -56,20 +50,15 @@ jobs:
               algorithm="RS256"
           )
 
-          # 3. Request Execution
-          # Endpoint for Wallester Business v1 Card Issuance
-          url = "https://api-frontend.wallester.com/v1/cards"
-          
+          # 4. Request Execution
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
               "X-Request-ID": str(uuid.uuid4())
           }
           
-          # Faithful Body including mandatory 3DS settings to resolve 422
           body = {
-              "account_id": os.getenv("ACCOUNT_ID"),
-              "person_id": os.getenv("PERSON_ID"),
+              "account_id": ACCOUNT_ID,
               "type": "Virtual",
               "currency_code": "EUR",
               "description": "GH Action Hello World",
@@ -79,11 +68,9 @@ jobs:
               }
           }
 
-          print(f"🚀 POST {url}")
-          print(f"📦 Payload: {body}")
-          
+          print(f"🚀 POST {API_URL}")
           try:
-              response = requests.post(url, json=body, headers=headers, timeout=15)
+              response = requests.post(API_URL, json=body, headers=headers, timeout=15)
               
               if response.status_code in [200, 201]:
                   print("✅ Success! Card Issued.")
