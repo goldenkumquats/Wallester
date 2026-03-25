@@ -27,47 +27,48 @@ jobs:
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
-          B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
+          # This should be the PEM content, NOT base64 encoded in the secret itself 
+          # to avoid double-encoding confusion.
+          PRIVATE_KEY_PEM: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
         run: |
-          import os, time, jwt, requests, base64, sys
+          import os, time, jwt, requests, sys, uuid
 
-          # 1. Load and Decode Private Key
+          # 1. Load Environment Variables
           api_key = os.getenv("API_KEY")
-          b64_key = os.getenv("B64_PRIVATE_KEY")
+          private_key_pem = os.getenv("PRIVATE_KEY_PEM")
           account_id = os.getenv("ACCOUNT_ID")
 
-          try:
-              # Decoding the Base64 version of your 'example_private' file
-              private_key_pem = base64.b64decode(b64_key).decode('utf-8')
-          except Exception as e:
-              print(f"❌ Key Decode Failed: {e}")
+          if not all([api_key, private_key_pem, account_id]):
+              print("❌ Missing required environment variables/secrets.")
               sys.exit(1)
 
-          # 2. Create Claims EXACTLY as per your documentation
-          # Headers for the JWT (Standard for RS256)
-          headers = {"alg": "RS256", "typ": "JWT"}
+          # 2. Generate Timestamp and Token
+          # We generate this as late as possible because of the 5-second rule
+          timestamp = int(time.time())
           
           payload = {
               "api_key": api_key,
-              "ts": int(time.time())
+              "ts": timestamp
           }
 
-          # 3. Sign the JWT
           try:
-              token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers=headers)
+              # Wallester expects RS256. Ensure the key is a valid PEM string.
+              token = jwt.encode(payload, private_key_pem, algorithm="RS256")
           except Exception as e:
-              print(f"❌ Signing Failed: {e}")
+              print(f"❌ JWT Signing Failed: {e}")
+              print("💡 Ensure your secret starts with '-----BEGIN RSA PRIVATE KEY-----'")
               sys.exit(1)
 
-          # 4. API Request
+          # 3. Prepare API Request
           url = "https://api.wallester.com/v1/cards"
           
-          # Adding a common User-Agent to bypass OpenResty 403 firewall
           request_headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Wallester-Integration/1.0"
+              # Documentation mentions X-Request-ID is required for consistent tracking
+              "X-Request-ID": str(uuid.uuid4()),
+              "User-Agent": "Wallester-Python-Integration/1.1"
           }
           
           body = {
@@ -76,16 +77,22 @@ jobs:
               "currency_code": "EUR"
           }
 
-          print(f"🚀 Sending request for Account: {account_id}...")
-          response = requests.post(url, json=body, headers=request_headers)
-
-          if response.status_code in [200, 201]:
-              print("✅ Success! Card Created.")
-              print(response.json())
-          else:
-              print(f"❌ Failed. Status: {response.status_code}")
-              print(f"Response Body: {response.text}")
+          # 4. Execute and Validate
+          try:
+              print(f"🚀 Requesting Card for Account: {account_id} (TS: {timestamp})")
+              response = requests.post(url, json=body, headers=request_headers, timeout=10)
               
-              if response.status_code == 403:
-                  print("\n💡 Note: If code is correct, check Wallester portal for 'KYB Verification' status.")
+              if response.status_code in [200, 201]:
+                  print("✅ Success! Card Created.")
+                  print(response.json())
+              else:
+                  print(f"❌ API Error: {response.status_code}")
+                  print(f"Response: {response.text}")
+                  
+                  if response.status_code == 401:
+                      print("💡 Auth Failed: Check if your API Key is active or if GitHub's clock is out of sync.")
+                  sys.exit(1)
+
+          except requests.exceptions.RequestException as e:
+              print(f"❌ Connection Error: {e}")
               sys.exit(1)
