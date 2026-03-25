@@ -27,54 +27,62 @@ jobs:
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
-          PRIVATE_KEY_PEM: ${{ secrets.WALLESTER_PRIVATE_KEY }}
+          # Expects the base64 string of the entire PEM file
+          B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
         run: |
-          import os, time, jwt, requests, sys, uuid
+          import os, time, jwt, requests, sys, uuid, base64
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Load Environment Variables
+          # 1. Fetch and Decode Base64 Key
           api_key = os.getenv("API_KEY")
-          raw_key = os.getenv("PRIVATE_KEY_PEM")
+          b64_key = os.getenv("B64_PRIVATE_KEY", "")
           account_id = os.getenv("ACCOUNT_ID")
 
-          if not raw_key:
-              print("❌ Error: WALLESTER_PRIVATE_KEY secret is empty or not found.")
+          if not b64_key:
+              print("❌ Error: B64_PRIVATE_KEY secret is empty.")
               sys.exit(1)
 
-          # 2. Parse Private Key (Handles PKCS#1 and PKCS#8)
           try:
-              # We encode to bytes because the cryptography library requires it
+              # Decode from Base64 to get the original PEM string
+              decoded_pem = base64.b64decode(b64_key).decode('utf-8').strip()
+          except Exception as e:
+              print(f"❌ Base64 Decoding Failed: {e}")
+              print("💡 Ensure your secret is a valid Base64 string of the PEM file.")
+              sys.exit(1)
+
+          # 2. Parse Private Key
+          try:
+              # Load the key object (handles PKCS#1 and PKCS#8)
               private_key_obj = serialization.load_pem_private_key(
-                  raw_key.encode('utf-8'),
-                  password=None  # Change to b"your_pass" if your key is encrypted
+                  decoded_pem.encode('utf-8'),
+                  password=None
               )
           except Exception as e:
               print(f"❌ Private Key Parsing Failed: {e}")
-              print("💡 Ensure your GitHub Secret includes the BEGIN/END lines and actual line breaks.")
+              if "InvalidHeader" in str(e):
+                  print(f"💡 Header mismatch. First 20 chars of decoded key: {decoded_pem[:20]}")
               sys.exit(1)
 
-          # 3. Generate Token (Do this immediately before the request)
+          # 3. Generate JWT (5-second window starts now)
           timestamp = int(time.time())
-          payload = {
-              "api_key": api_key,
-              "ts": timestamp
-          }
-
           try:
-              # Passing the object directly to PyJWT solves the 'public key' parsing error
-              token = jwt.encode(payload, private_key_obj, algorithm="RS256")
+              token = jwt.encode(
+                  {"api_key": api_key, "ts": timestamp}, 
+                  private_key_obj, 
+                  algorithm="RS256"
+              )
           except Exception as e:
               print(f"❌ JWT Signing Failed: {e}")
               sys.exit(1)
 
           # 4. API Request
           url = "https://api.wallester.com/v1/cards"
-          request_headers = {
+          headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
               "X-Request-ID": str(uuid.uuid4()),
-              "User-Agent": "Wallester-GitHub-Provider/1.2"
+              "User-Agent": "Wallester-GitHub-Action/1.3"
           }
           
           body = {
@@ -83,17 +91,15 @@ jobs:
               "currency_code": "EUR"
           }
 
-          print(f"🚀 Sending Request (TS: {timestamp}, RID: {request_headers['X-Request-ID']})")
+          print(f"🚀 Sending Request (X-Request-ID: {headers['X-Request-ID']})")
           
           try:
-              response = requests.post(url, json=body, headers=request_headers, timeout=10)
-              
+              response = requests.post(url, json=body, headers=headers, timeout=10)
               if response.status_code in [200, 201]:
-                  print("✅ Success! Card issued.")
+                  print("✅ Success! Card Created.")
                   print(response.json())
               else:
-                  print(f"❌ API Rejected Request (Status {response.status_code})")
-                  print(f"Response Body: {response.text}")
+                  print(f"❌ API Error {response.status_code}: {response.text}")
                   sys.exit(1)
           except Exception as e:
               print(f"❌ Connection Error: {e}")
