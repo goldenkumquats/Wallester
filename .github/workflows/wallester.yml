@@ -1,4 +1,4 @@
-name: Wallester - Create and Reveal (Fixed UUID)
+name: Wallester - Create and Reveal (Verbose Debug)
 
 on:
   workflow_dispatch:
@@ -22,19 +22,22 @@ jobs:
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           PROFILE_ID: ${{ secrets.WALLESTER_PROFILE_ID }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid, re
+          import os, time, jwt, requests, sys, base64, uuid, re, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
           # --- 1. KEY SETUP ---
-          b64_str = os.getenv("B64_PRIVATE_KEY").strip()
-          private_key = serialization.load_pem_private_key(base64.b64decode(b64_str), password=None)
-          pub_pem = private_key.public_key().public_bytes(
-              encoding=serialization.Encoding.PEM,
-              format=serialization.PublicFormat.SubjectPublicKeyInfo
-          ).decode('utf-8')
-          pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+          try:
+              b64_str = os.getenv("B64_PRIVATE_KEY").strip()
+              private_key = serialization.load_pem_private_key(base64.b64decode(b64_str), password=None)
+              pub_pem = private_key.public_key().public_bytes(
+                  encoding=serialization.Encoding.PEM,
+                  format=serialization.PublicFormat.SubjectPublicKeyInfo
+              ).decode('utf-8')
+              pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+          except Exception as e:
+              print(f"❌ Key Loading Failed: {e}"); sys.exit(1)
 
           # --- 2. AUTH ---
           def get_headers():
@@ -44,35 +47,47 @@ jobs:
                   "Content-Type": "application/json"
               }
 
-          # --- 3. CREATE NEW CARD ---
-          # Using the specific account ID you provided
+          # --- 3. CREATE NEW CARD (VERBOSE DEBUG) ---
           ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
           PROFILE_ID = os.getenv("PROFILE_ID").strip()
 
+          # We are switching to 'VIRTUAL' (Uppercase) as it's the strict enum for certain API versions
           create_payload = {
               "account_id": ACCOUNT_ID,
               "card_metadata_profile_id": PROFILE_ID,
-              "type": "virtual_disposable", # Try "virtual" if this fails
+              "type": "VIRTUAL", 
               "public_key": pub_b64
           }
 
-          print(f"📡 Requesting card for Account: {ACCOUNT_ID}")
+          print(f"📡 FULL REQUEST DIAGNOSTIC")
+          print(f"URL: https://api-frontend.wallester.com/v1/cards")
+          print(f"Payload: {json.dumps(create_payload, indent=2)}")
+          
           res = requests.post("https://api-frontend.wallester.com/v1/cards", 
                              headers=get_headers(), json=create_payload)
 
           if not res.ok:
-              print(f"❌ Creation Failed: {res.status_code}\n{res.text}")
+              print(f"\n❌ HTTP ERROR {res.status_code}")
+              print(f"Response Body: {res.text}")
+              try:
+                  err = res.json()
+                  print(f"Error Code: {err.get('error_code')}")
+                  print(f"Error Message: {err.get('message')}")
+              except:
+                  pass
               sys.exit(1)
 
           card_data = res.json()['card']
           CARD_ID = card_data['id']
-          print(f"✅ Created Card: {CARD_ID}")
+          print(f"✅ Success! Card ID Created: {CARD_ID}")
 
           # --- 4. REVEAL ---
           def reveal(endpoint, label):
               url = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/{endpoint}"
               resp = requests.post(url, headers=get_headers(), json={"public_key": pub_b64})
-              if not resp.ok: return None
+              if not resp.ok: 
+                  print(f"⚠️ Reveal failed for {endpoint}: {resp.text}")
+                  return None
               
               val = resp.json().get(endpoint.replace('-', '_'))
               clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', val)
@@ -88,4 +103,4 @@ jobs:
 
           if pan and cvv:
               dt = datetime.strptime(card_data['expiry_date'].split('T')[0], '%Y-%m-%d')
-              print(f"\n✨ SUCCESS: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+              print(f"\n✨ FINAL DATA: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
