@@ -1,10 +1,10 @@
-name: Wallester Final Fix (Email 3DS + Decryption)
+name: Wallester Final Status Check
 
 on:
   workflow_dispatch:
 
 jobs:
-  issue-and-reveal:
+  check-card:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -15,85 +15,44 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Execute
+      - name: Verify Card Settings
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid, json
-          from cryptography.hazmat.primitives import serialization, hashes
-          from cryptography.hazmat.primitives.asymmetric import padding
+          import os, time, jwt, requests, sys, base64, uuid
+          from cryptography.hazmat.primitives import serialization
 
-          # 1. Prepare Keys
+          # 1. Setup
+          CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-              pub_pem = private_key.public_key().public_bytes(
-                  encoding=serialization.Encoding.PEM,
-                  format=serialization.PublicFormat.SubjectPublicKeyInfo
-              )
-              pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          # 2. API Setup
-          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
           token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
           
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json",
-              "X-Request-ID": str(uuid.uuid4())
-          }
+          # 2. Fetch the card we just created
+          print(f"📡 Inspecting Card: {CARD_ID}")
+          res = requests.get(
+              f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", 
+              headers={"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4())}
+          )
 
-          # Force Email 3DS by disabling 'out_of_band'
-          body = {
-              "account_id": ACCOUNT_ID,
-              "type": "Virtual",
-              "currency_code": "EUR",
-              "public_key": pub_b64,
-              "3d_secure_settings": {
-                  "email": "goldenkumquats@gmail.com",
-                  "password": os.getenv("TDS_PASSWORD"), # Required for Email 3DS
-                  "out_of_band_enabled": False           # Forces Email flow
-              }
-          }
-
-          # 3. Execution
-          print("🚀 Issuing Card & Requesting Encrypted Data...")
-          res = requests.post("https://api-frontend.wallester.com/v1/cards", json=body, headers=headers)
-
-          if res.status_code in [200, 201]:
-              data = res.json()
-              print(f"✅ Card Created: {data.get('card', {}).get('id')}")
+          if res.status_code == 200:
+              card = res.json().get('card', {})
+              tds = card.get('3d_secure_settings', {})
               
-              # Wallester usually returns 'encrypted_data' as a single block 
-              # containing both PAN and CVV.
-              enc_data = data.get('encrypted_data')
-              if enc_data:
-                  print("🔐 Decrypting Sensitive Data...")
-                  try:
-                      # CRITICAL: Wallester often uses a label for the RSA-OAEP padding
-                      # We try with label=b"CardNumber" first, then label=None
-                      for label_val in [b"CardNumber", None]:
-                          try:
-                              decrypted = private_key.decrypt(
-                                  base64.b64decode(enc_data),
-                                  padding.OAEP(
-                                      mgf=padding.MGF1(hashes.SHA256()), 
-                                      algorithm=hashes.SHA256(), 
-                                      label=label_val
-                                  )
-                              )
-                              print(f"💎 DECRYPTED: {decrypted.decode('utf-8')}")
-                              break
-                          except:
-                              continue
-                  except Exception as decrypt_err:
-                      print(f"❌ Decryption Failed. Check key match.")
-              else:
-                  print("⚠️ No encrypted_data. Your API user role must be 'Admin' or 'Developer' with 'Card Details' access.")
+              print("\n" + "="*40)
+              print(f"CARD STATUS: {card.get('status')}")
+              print(f"3DS EMAIL:   {tds.get('email')}")
+              print(f"APP PUSH:    {'ENABLED' if tds.get('out_of_band_enabled') else 'DISABLED (FORCED EMAIL)'}")
+              print("="*40)
+              
+              if not card.get('public_key'):
+                  print("\n💡 ACTION REQUIRED: Your user profile is missing 'PCI/Sensitive Data' rights.")
+                  print("The Admin must change your Role to 'Admin' in the Wallester Portal.")
           else:
-              print(f"❌ API Error: {res.text}")
+              print(f"❌ Failed to fetch card: {res.text}")
