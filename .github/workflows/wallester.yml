@@ -27,44 +27,28 @@ jobs:
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
-          # Expects the base64 string of the entire PEM file
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
         run: |
           import os, time, jwt, requests, sys, uuid, base64
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Fetch and Decode Base64 Key
+          # 1. Decode Private Key
           api_key = os.getenv("API_KEY")
           b64_key = os.getenv("B64_PRIVATE_KEY", "")
           account_id = os.getenv("ACCOUNT_ID")
 
-          if not b64_key:
-              print("❌ Error: B64_PRIVATE_KEY secret is empty.")
-              sys.exit(1)
-
           try:
-              # Decode from Base64 to get the original PEM string
               decoded_pem = base64.b64decode(b64_key).decode('utf-8').strip()
-          except Exception as e:
-              print(f"❌ Base64 Decoding Failed: {e}")
-              print("💡 Ensure your secret is a valid Base64 string of the PEM file.")
-              sys.exit(1)
-
-          # 2. Parse Private Key
-          try:
-              # Load the key object (handles PKCS#1 and PKCS#8)
               private_key_obj = serialization.load_pem_private_key(
                   decoded_pem.encode('utf-8'),
                   password=None
               )
           except Exception as e:
-              print(f"❌ Private Key Parsing Failed: {e}")
-              if "InvalidHeader" in str(e):
-                  print(f"💡 Header mismatch. First 20 chars of decoded key: {decoded_pem[:20]}")
+              print(f"❌ Key Loading Failed: {e}")
               sys.exit(1)
 
-          # 3. Generate JWT (5-second window starts now)
+          # 2. Generate JWT (Strict 5-second window)
           timestamp = int(time.time())
           try:
               token = jwt.encode(
@@ -76,31 +60,38 @@ jobs:
               print(f"❌ JWT Signing Failed: {e}")
               sys.exit(1)
 
-          # 4. API Request
-          url = "https://api.wallester.com/v1/cards"
+          # 3. Corrected API Request for Wallester Business
+          # The card is a sub-resource of the account
+          url = f"https://api-frontend.wallester.com/v1/accounts/{account_id}/cards"
+          
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
               "X-Request-ID": str(uuid.uuid4()),
-              "User-Agent": "Wallester-GitHub-Action/1.3"
+              "User-Agent": "Wallester-GitHub-Action/1.5"
           }
           
+          # Standard payload for virtual business card issuance
           body = {
-              "account_id": account_id,
               "type": "Virtual",
-              "currency_code": "EUR"
+              "currency_code": "EUR",
+              "description": "Card issued via GitHub Actions"
           }
 
-          print(f"🚀 Sending Request (X-Request-ID: {headers['X-Request-ID']})")
+          print(f"🚀 Issuing card to Account: {account_id}")
+          print(f"🔗 URL: {url}")
           
           try:
-              response = requests.post(url, json=body, headers=headers, timeout=10)
+              response = requests.post(url, json=body, headers=headers, timeout=15)
               if response.status_code in [200, 201]:
-                  print("✅ Success! Card Created.")
+                  print("✅ Success! Card issued.")
                   print(response.json())
               else:
-                  print(f"❌ API Error {response.status_code}: {response.text}")
+                  print(f"❌ Error {response.status_code}: {response.text}")
+                  # If 404, the account_id might be wrong or the API version moved
+                  if response.status_code == 404:
+                      print("💡 Tip: Check if the Account ID is correct and active in the portal.")
                   sys.exit(1)
           except Exception as e:
-              print(f"❌ Connection Error: {e}")
+              print(f"❌ Request Failed: {e}")
               sys.exit(1)
