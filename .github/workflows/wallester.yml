@@ -1,10 +1,10 @@
-name: Wallester Reveal - Final Hash Logic
+name: Wallester Reveal - Final Implementation
 
 on:
   workflow_dispatch:
 
 jobs:
-  reveal:
+  reveal-card:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -15,7 +15,7 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Execute
+      - name: Execute Reveal
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
@@ -26,90 +26,76 @@ jobs:
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # 1. SETUP
-          print("🛠️ [DEBUG] Loading Keys...")
+          # --- 1. KEY INITIALIZATION ---
+          print("🛠️ [STEP 1] Loading RSA Keys...")
           try:
+              # Decode the GH Secret to get the PEM
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-              pub_bytes = private_key.public_key().public_bytes(
+              
+              # Generate Public Key in PEM format as required by Docs
+              public_key = private_key.public_key()
+              pub_pem = public_key.public_bytes(
                   encoding=serialization.Encoding.PEM,
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
-              )
-              pub_b64 = base64.b64encode(pub_bytes).decode('utf-8')
+              ).decode('utf-8')
+              
+              # Base64 encode the ENTIRE PEM string (including headers)
+              pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+              print("✅ Keys loaded and Public Key encoded to Base64.")
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          def clean_and_decrypt(pem_string, label_text):
-              if not pem_string: return None
-              # Strip PEM wrapper
-              clean = re.sub(r'-----BEGIN.*?-----', '', pem_string)
-              clean = re.sub(r'-----END.*?-----', '', clean)
+          # --- 2. HELPERS ---
+          def get_auth_header():
+              # JWT has a 5-second TTL per docs
+              payload = {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}
+              token = jwt.encode(payload, private_key, algorithm="RS256")
+              return {"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4()), "Content-Type": "application/json"}
+
+          def clean_and_decrypt(encrypted_val, label):
+              if not encrypted_val: return None
+              # Strip PEM wrappers and newlines
+              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', encrypted_val)
               clean = "".join(clean.split())
               ciphertext = base64.b64decode(clean)
               
-              print(f"\n🔓 Testing {label_text} (Clean Len: {len(clean)})...")
-
-              # TRY 1: SHA-256 Algorithm with SHA-1 MGF1 (Common in Banking HSMs)
+              # Wallester standard: OAEP with SHA256 and field labels
               try:
-                  print(f"   ⏳ Attempting SHA-256 with SHA-1 MGF1...")
-                  return private_key.decrypt(
-                      ciphertext,
-                      padding.OAEP(
-                          mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                          algorithm=hashes.SHA256(),
-                          label=label_text.encode()
-                      )
-                  ).decode('utf-8')
-              except: pass
-
-              # TRY 2: Pure SHA-256 everywhere
-              try:
-                  print(f"   ⏳ Attempting Pure SHA-256...")
                   return private_key.decrypt(
                       ciphertext,
                       padding.OAEP(
                           mgf=padding.MGF1(algorithm=hashes.SHA256()),
                           algorithm=hashes.SHA256(),
-                          label=label_text.encode()
+                          label=label.encode()
                       )
                   ).decode('utf-8')
-              except: pass
+              except Exception as e:
+                  print(f"   ⚠️ Decryption failed for {label}: {e}")
+                  return None
 
-              # TRY 3: Pure SHA-1 everywhere (Legacy)
-              try:
-                  print(f"   ⏳ Attempting Pure SHA-1...")
-                  return private_key.decrypt(
-                      ciphertext,
-                      padding.OAEP(
-                          mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                          algorithm=hashes.SHA1(),
-                          label=label_text.encode()
-                      )
-                  ).decode('utf-8')
-              except: pass
-
-              return None
-
-          # 2. CALLS
+          # --- 3. EXECUTION ---
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
-          headers = {
-              "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
-              "X-Request-ID": str(uuid.uuid4()),
-              "Content-Type": "application/json"
-          }
+          URL = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}"
+          
+          print(f"📡 Requesting data for Card: {CARD_ID}")
+          headers = get_auth_header()
           body = {"public_key": pub_b64}
 
-          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers).json()
-          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body).json()
-          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body).json()
+          # Get Metadata
+          res_m = requests.get(URL, headers=headers).json()
+          
+          # Get Encrypted Values
+          res_p = requests.post(f"{URL}/encrypted-card-number", headers=headers, json=body).json()
+          res_c = requests.post(f"{URL}/encrypted-cvv2", headers=headers, json=body).json()
 
-          # 3. OUTPUT
+          # --- 4. DECRYPT & DISPLAY ---
           pan = clean_and_decrypt(res_p.get('encrypted_card_number'), "CardNumber")
           cvv = clean_and_decrypt(res_c.get('encrypted_cvv2'), "CVV")
-
+          
           if pan and cvv:
-              exp = res_m.get('card', {}).get('expiry_date', "2000-01-01")
-              dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
-              print(f"\nRESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+              exp_raw = res_m.get('card', {}).get('expiry_date', "2000-01-01")
+              dt = datetime.strptime(exp_raw.split('T')[0], '%Y-%m-%d')
+              print(f"\n⭐ RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
           else:
-              print("\n❌ All known decryption methods failed.")
+              print("\n❌ Failed to decrypt. Verify your Private Key matches the one used at card creation.")
