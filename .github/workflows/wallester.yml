@@ -1,10 +1,10 @@
-name: Wallester Issue and Reveal Card
+name: Wallester List Company Cards
 
 on:
   workflow_dispatch:
 
 jobs:
-  issue-and-reveal:
+  list-cards:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -15,57 +15,52 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Process Card
+      - name: Fetch Cards
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid
           from cryptography.hazmat.primitives import serialization
 
-          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
-          BASE_URL = "https://api-frontend.wallester.com/v1"
-          
+          # 1. Setup
+          COMPANY_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
+          URL = f"https://api-frontend.wallester.com/v1/companies/{COMPANY_ID}/cards"
+
           try:
-              b64_key = os.getenv("B64_PRIVATE_KEY", "")
-              pem_data = base64.b64decode(b64_key).decode('utf-8').strip()
+              pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          def get_token():
-              return jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
+          # 2. JWT Generation
+          token = jwt.encode(
+              {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, 
+              private_key, 
+              algorithm="RS256"
+          )
 
-          # Step 1: Issue
-          headers = {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json", "X-Request-ID": str(uuid.uuid4())}
-          body = {
-              "account_id": ACCOUNT_ID, "type": "Virtual", "name": "Golden Kumquat Card",
-              "3d_secure_settings": {"email": "goldenkumquats@gmail.com", "password": os.getenv("TDS_PASSWORD"), "out_of_band_enabled": True},
-              "security": {"internet_purchase_enabled": True}
+          # 3. Request
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "X-Request-ID": str(uuid.uuid4())
           }
-          res_issue = requests.post(f"{BASE_URL}/cards", json=body, headers=headers, timeout=15)
-          if res_issue.status_code not in [200, 201]:
-              print(f"❌ Issue Error: {res_issue.text}"); sys.exit(1)
           
-          card_id = res_issue.json().get('card', {}).get('id')
-          print(f"✅ Card Issued: {card_id}")
+          print(f"📡 Fetching cards for company {COMPANY_ID}...")
+          response = requests.get(URL, headers=headers, timeout=15)
 
-          # Step 2: Details (Trying the Business path)
-          details_url = f"{BASE_URL}/cards/{card_id}/sensitive-data"
-          print(f"🔍 Attempting: {details_url}")
-          res_details = requests.get(details_url, headers={"Authorization": f"Bearer {get_token()}", "X-Request-ID": str(uuid.uuid4())})
-
-          if res_details.status_code != 200:
-              print("⚠️ Path 1 failed. Trying Query Param Fallback...")
-              details_url = f"{BASE_URL}/cards/{card_id}?include=details"
-              res_details = requests.get(details_url, headers={"Authorization": f"Bearer {get_token()}", "X-Request-ID": str(uuid.uuid4())})
-
-          if res_details.status_code == 200:
-              print("💎 DATA RECEIVED:")
-              print(res_details.json())
+          if response.status_code == 200:
+              data = response.json()
+              cards = data.get('cards', [])
+              print(f"✅ Found {len(cards)} cards.\n")
+              
+              for card in cards:
+                  print(f"ID: {card.get('id')}")
+                  print(f"Name: {card.get('name')}")
+                  print(f"Masked: {card.get('masked_card_number')}")
+                  print(f"Status: {card.get('status')}")
+                  print("-" * 20)
           else:
-              print(f"❌ Both paths failed. Final Status: {res_details.status_code}")
-              print(f"Final Body: {res_details.text}")
-              sys.exit(1)
+              print(f"❌ Failed: {response.status_code}")
+              print(response.text)
