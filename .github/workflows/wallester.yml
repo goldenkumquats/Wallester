@@ -1,10 +1,10 @@
-name: Wallester Final Status Check
+name: Wallester Deep Inspection
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-card:
+  debug-api:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -13,46 +13,33 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install PyJWT cryptography requests
+          run: pip install PyJWT cryptography requests
 
-      - name: Verify Card Settings
+      - name: Full JSON Dump
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid
+          import os, time, jwt, requests, sys, base64, uuid, json
           from cryptography.hazmat.primitives import serialization
 
-          # 1. Setup
+          # 1. Auth
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
-          try:
-              pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
-              private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-          except Exception as e:
-              print(f"❌ Key Error: {e}"); sys.exit(1)
-
+          pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
+          private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
           token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
           
-          # 2. Fetch the card we just created
-          print(f"📡 Inspecting Card: {CARD_ID}")
-          res = requests.get(
-              f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", 
-              headers={"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4())}
-          )
-
-          if res.status_code == 200:
-              card = res.json().get('card', {})
-              tds = card.get('3d_secure_settings', {})
-              
-              print("\n" + "="*40)
-              print(f"CARD STATUS: {card.get('status')}")
-              print(f"3DS EMAIL:   {tds.get('email')}")
-              print(f"APP PUSH:    {'ENABLED' if tds.get('out_of_band_enabled') else 'DISABLED (FORCED EMAIL)'}")
-              print("="*40)
-              
-              if not card.get('public_key'):
-                  print("\n💡 ACTION REQUIRED: Your user profile is missing 'PCI/Sensitive Data' rights.")
-                  print("The Admin must change your Role to 'Admin' in the Wallester Portal.")
-          else:
-              print(f"❌ Failed to fetch card: {res.text}")
+          # 2. Fetch with ALL possible headers
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "X-Request-ID": str(uuid.uuid4()),
+              "Accept": "application/json"
+          }
+          
+          # We try the GET /v1/cards/{id} but check EVERY field
+          res = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers)
+          
+          print("--- FULL API RESPONSE KEYS ---")
+          print(json.dumps(res.json(), indent=2))
+          print("------------------------------")
