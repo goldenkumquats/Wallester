@@ -1,4 +1,4 @@
-name: Wallester Verbose Reveal & Debug
+name: Wallester Final Decryption Crack
 
 on:
   workflow_dispatch:
@@ -26,91 +26,74 @@ jobs:
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # --- STEP 1: KEY INITIALIZATION ---
-          print("🛠️ [STEP 1] Initializing Keys...")
+          # 1. Setup
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
           BASE_URL = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}"
           
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-              
-              # Derive Public Key for the POST body
               pub_pem = private_key.public_key().public_bytes(
                   encoding=serialization.Encoding.PEM,
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
               )
               pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
-              print("✅ Public Key derived and encoded.")
           except Exception as e:
-              print(f"❌ Key Setup Failed: {e}"); sys.exit(1)
+              print(f"❌ Key Error: {e}"); sys.exit(1)
 
           def get_headers():
               token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
-              return {
-                  "Authorization": f"Bearer {token}",
-                  "X-Request-ID": str(uuid.uuid4()),
-                  "Content-Type": "application/json",
-                  "Accept": "application/json"
-              }
+              return {"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4()), "Content-Type": "application/json"}
 
-          # --- STEP 2: FETCH METADATA ---
-          print(f"\n📡 [STEP 2] Fetching Metadata (GET) for Expiry...")
-          h = get_headers()
-          res_m = requests.get(BASE_URL, headers=h)
-          print(f"   Status: {res_m.status_code}")
-          if res_m.status_code != 200:
-              print(f"   Response: {res_m.text}")
-          
-          # --- STEP 3: FETCH PAN (POST) ---
-          print(f"\n📡 [STEP 3] Fetching Encrypted PAN (POST)...")
-          pan_url = f"{BASE_URL}/encrypted-card-number"
-          pan_payload = {"public_key": pub_b64}
-          
-          print(f"   URL: {pan_url}")
-          print(f"   Payload Keys: {list(pan_payload.keys())}")
-          
-          res_p = requests.post(pan_url, headers=get_headers(), json=pan_payload)
-          print(f"   Status: {res_p.status_code}")
-          if res_p.status_code != 200:
-              print(f"   ERROR DETAIL: {res_p.text}")
-
-          # --- STEP 4: FETCH CVV (POST) ---
-          print(f"\n📡 [STEP 4] Fetching Encrypted CVV (POST)...")
-          cvv_url = f"{BASE_URL}/encrypted-cvv2"
-          res_c = requests.post(cvv_url, headers=get_headers(), json=pan_payload)
-          print(f"   Status: {res_c.status_code}")
-          if res_c.status_code != 200:
-              print(f"   ERROR DETAIL: {res_c.text}")
-
-          # --- STEP 5: DECRYPTION & FORMATTING ---
-          if all(r.status_code == 200 for r in [res_m, res_p, res_c]):
-              print("\n🔐 [STEP 5] All components received. Decrypting...")
+          # --- DECRYPTION MATRIX ---
+          def multi_decrypt(enc_b64, label_str):
+              if not enc_b64: return None
+              ciphertext = base64.b64decode(enc_b64)
               
+              # Trial 1: OAEP SHA-256 (Standard)
+              # Trial 2: OAEP SHA-1 (Legacy/HSM Standard)
+              # Trial 3: PKCS1v15 (Old School)
+              hash_algs = [hashes.SHA256(), hashes.SHA1()]
+              labels = [label_str.encode(), None]
+
+              for h_alg in hash_algs:
+                  for lbl in labels:
+                      try:
+                          return private_key.decrypt(
+                              ciphertext,
+                              padding.OAEP(mgf=padding.MGF1(algorithm=h_alg), algorithm=h_alg, label=lbl)
+                          ).decode('utf-8')
+                      except: continue
+              
+              try: # Final Hail Mary: PKCS1v15
+                  return private_key.decrypt(ciphertext, padding.PKCS1v15()).decode('utf-8')
+              except: return None
+
+          # 2. Fetch
+          h = get_headers()
+          p = {"public_key": pub_b64}
+          
+          res_m = requests.get(BASE_URL, headers=h)
+          res_p = requests.post(f"{BASE_URL}/encrypted-card-number", headers=h, json=p)
+          res_c = requests.post(f"{BASE_URL}/encrypted-cvv2", headers=h, json=p)
+
+          # 3. Process
+          if all(r.status_code == 200 for r in [res_m, res_p, res_c]):
               # Expiry
               exp_iso = res_m.json().get('card', {}).get('expiry_date', "2000-01-01")
               dt = datetime.strptime(exp_iso.split('T')[0], '%Y-%m-%d')
               mm, yy = dt.strftime('%m'), dt.strftime('%y')
 
-              def decrypt(enc_b64, label):
-                  for l_val in [label.encode(), None]:
-                      try:
-                          return private_key.decrypt(
-                              base64.b64decode(enc_b64),
-                              padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=l_val)
-                          ).decode('utf-8')
-                      except: continue
-                  return None
-
-              pan = decrypt(res_p.json().get('encrypted_card_number'), "CardNumber")
-              cvv = decrypt(res_c.json().get('encrypted_cvv2'), "CVV")
+              # Decrypt with the new matrix
+              pan = multi_decrypt(res_p.json().get('encrypted_card_number'), "CardNumber")
+              cvv = multi_decrypt(res_c.json().get('encrypted_cvv2'), "CVV")
 
               if pan and cvv:
-                  print("\n" + "⭐" * 40)
+                  print("\n" + "💎" * 20)
                   print(f"RESULT: {pan}|{mm}|{yy}|{cvv}")
-                  print("⭐" * 40)
+                  print("💎" * 20)
               else:
-                  print("❌ Decryption failed. The encrypted payload was received but the RSA key/padding failed to open it.")
+                  print("❌ Decryption failed all permutations.")
+                  print(f"PAN Blob: {res_p.json().get('encrypted_card_number')[:20]}...")
           else:
-              print("\n❌ Execution halted due to 400/405/500 errors above.")
-              sys.exit(1)
+              print("❌ API Error on one or more components.")
