@@ -1,4 +1,4 @@
-name: Wallester Final Reveal (PEM + Label Fix)
+name: Wallester Reveal - Final Hash Logic
 
 on:
   workflow_dispatch:
@@ -26,7 +26,8 @@ jobs:
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # 1. Initialize RSA
+          # 1. SETUP
+          print("🛠️ [DEBUG] Loading Keys...")
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
@@ -38,16 +39,32 @@ jobs:
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          def wallester_decrypt(pem_string, label_text):
+          def clean_and_decrypt(pem_string, label_text):
               if not pem_string: return None
-              # Strip PEM headers/footers and newlines
+              # Strip PEM wrapper
               clean = re.sub(r'-----BEGIN.*?-----', '', pem_string)
               clean = re.sub(r'-----END.*?-----', '', clean)
               clean = "".join(clean.split())
+              ciphertext = base64.b64decode(clean)
               
-              # Standard RSA-OAEP with SHA256 and required Label
+              print(f"\n🔓 Testing {label_text} (Clean Len: {len(clean)})...")
+
+              # TRY 1: SHA-256 Algorithm with SHA-1 MGF1 (Common in Banking HSMs)
               try:
-                  ciphertext = base64.b64decode(clean)
+                  print(f"   ⏳ Attempting SHA-256 with SHA-1 MGF1...")
+                  return private_key.decrypt(
+                      ciphertext,
+                      padding.OAEP(
+                          mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                          algorithm=hashes.SHA256(),
+                          label=label_text.encode()
+                      )
+                  ).decode('utf-8')
+              except: pass
+
+              # TRY 2: Pure SHA-256 everywhere
+              try:
+                  print(f"   ⏳ Attempting Pure SHA-256...")
                   return private_key.decrypt(
                       ciphertext,
                       padding.OAEP(
@@ -56,32 +73,43 @@ jobs:
                           label=label_text.encode()
                       )
                   ).decode('utf-8')
-              except Exception as e:
-                  print(f"   ⚠️ Decryption failed for {label_text}: {e}")
-                  return None
+              except: pass
 
-          # 2. Fetch Data
+              # TRY 3: Pure SHA-1 everywhere (Legacy)
+              try:
+                  print(f"   ⏳ Attempting Pure SHA-1...")
+                  return private_key.decrypt(
+                      ciphertext,
+                      padding.OAEP(
+                          mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                          algorithm=hashes.SHA1(),
+                          label=label_text.encode()
+                      )
+                  ).decode('utf-8')
+              except: pass
+
+              return None
+
+          # 2. CALLS
+          CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
           headers = {
               "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
               "X-Request-ID": str(uuid.uuid4()),
               "Content-Type": "application/json"
           }
-          CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
-          BASE = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}"
-          
-          meta = requests.get(BASE, headers=headers).json()
-          res_p = requests.post(f"{BASE}/encrypted-card-number", headers=headers, json={"public_key": pub_b64}).json()
-          res_c = requests.post(f"{BASE}/encrypted-cvv2", headers=headers, json={"public_key": pub_b64}).json()
+          body = {"public_key": pub_b64}
 
-          # 3. Process Result
-          pan = wallester_decrypt(res_p.get('encrypted_card_number'), "CardNumber")
-          cvv = wallester_decrypt(res_c.get('encrypted_cvv2'), "CVV")
-          
+          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers).json()
+          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body).json()
+          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body).json()
+
+          # 3. OUTPUT
+          pan = clean_and_decrypt(res_p.get('encrypted_card_number'), "CardNumber")
+          cvv = clean_and_decrypt(res_c.get('encrypted_cvv2'), "CVV")
+
           if pan and cvv:
-              exp_raw = meta.get('card', {}).get('expiry_date', "2000-01-01")
-              dt = datetime.strptime(exp_raw.split('T')[0], '%Y-%m-%d')
-              print(f"\n✅ SUCCESS\n{'='*40}")
-              print(f"RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
-              print(f"{'='*40}\n")
+              exp = res_m.get('card', {}).get('expiry_date', "2000-01-01")
+              dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
+              print(f"\nRESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
           else:
-              print("❌ Execution failed. Check the logs above.")
+              print("\n❌ All known decryption methods failed.")
