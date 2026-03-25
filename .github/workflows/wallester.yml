@@ -1,4 +1,4 @@
-name: Wallester Final Decryption Crack
+name: Wallester Reveal (Base64 Padding Fix)
 
 on:
   workflow_dispatch:
@@ -13,20 +13,19 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install PyJWT cryptography requests
+          run: pip install PyJWT cryptography requests
 
-      - name: Execute Reveal
+      - name: Execute
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid, json
+          import os, time, jwt, requests, sys, base64, uuid, json, binascii
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # 1. Setup
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
           BASE_URL = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}"
           
@@ -41,59 +40,56 @@ jobs:
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          def get_headers():
-              token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
-              return {"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4()), "Content-Type": "application/json"}
-
-          # --- DECRYPTION MATRIX ---
-          def multi_decrypt(enc_b64, label_str):
-              if not enc_b64: return None
-              ciphertext = base64.b64decode(enc_b64)
+          def safe_b64decode(data):
+              """Fixes padding and strips whitespace for problematic base64 strings."""
+              if not data: return None
+              data = data.strip()
+              # If it's a JWE (contains dots), we only want the ciphertext part (usually index 3)
+              if "." in data:
+                  parts = data.split(".")
+                  print(f"   [Note] JWE detected ({len(parts)} parts). Using ciphertext component.")
+                  data = parts[3] if len(parts) > 3 else parts[0]
               
-              # Trial 1: OAEP SHA-256 (Standard)
-              # Trial 2: OAEP SHA-1 (Legacy/HSM Standard)
-              # Trial 3: PKCS1v15 (Old School)
-              hash_algs = [hashes.SHA256(), hashes.SHA1()]
-              labels = [label_str.encode(), None]
+              missing_padding = len(data) % 4
+              if missing_padding:
+                  data += '=' * (4 - missing_padding)
+              try:
+                  return base64.b64decode(data)
+              except Exception as e:
+                  print(f"   [Error] Could not decode string: {e}")
+                  return None
 
-              for h_alg in hash_algs:
-                  for lbl in labels:
+          def multi_decrypt(enc_str, label_str):
+              ciphertext = safe_b64decode(enc_str)
+              if not ciphertext: return None
+              
+              for h_alg in [hashes.SHA256(), hashes.SHA1()]:
+                  for lbl in [label_str.encode(), None]:
                       try:
                           return private_key.decrypt(
                               ciphertext,
                               padding.OAEP(mgf=padding.MGF1(algorithm=h_alg), algorithm=h_alg, label=lbl)
                           ).decode('utf-8')
                       except: continue
-              
-              try: # Final Hail Mary: PKCS1v15
-                  return private_key.decrypt(ciphertext, padding.PKCS1v15()).decode('utf-8')
-              except: return None
+              return None
 
-          # 2. Fetch
-          h = get_headers()
+          h = {"Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}", "X-Request-ID": str(uuid.uuid4()), "Content-Type": "application/json"}
           p = {"public_key": pub_b64}
           
           res_m = requests.get(BASE_URL, headers=h)
           res_p = requests.post(f"{BASE_URL}/encrypted-card-number", headers=h, json=p)
           res_c = requests.post(f"{BASE_URL}/encrypted-cvv2", headers=h, json=p)
 
-          # 3. Process
-          if all(r.status_code == 200 for r in [res_m, res_p, res_c]):
-              # Expiry
-              exp_iso = res_m.json().get('card', {}).get('expiry_date', "2000-01-01")
-              dt = datetime.strptime(exp_iso.split('T')[0], '%Y-%m-%d')
-              mm, yy = dt.strftime('%m'), dt.strftime('%y')
-
-              # Decrypt with the new matrix
+          if res_p.status_code == 200 and res_c.status_code == 200:
+              exp = res_m.json().get('card', {}).get('expiry_date', "2000-01-01")
+              dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
+              
               pan = multi_decrypt(res_p.json().get('encrypted_card_number'), "CardNumber")
               cvv = multi_decrypt(res_c.json().get('encrypted_cvv2'), "CVV")
 
               if pan and cvv:
-                  print("\n" + "💎" * 20)
-                  print(f"RESULT: {pan}|{mm}|{yy}|{cvv}")
-                  print("💎" * 20)
+                  print(f"\nRESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
               else:
-                  print("❌ Decryption failed all permutations.")
-                  print(f"PAN Blob: {res_p.json().get('encrypted_card_number')[:20]}...")
+                  print("❌ Decryption failed. Raw sample:", res_p.json().get('encrypted_card_number')[:30])
           else:
-              print("❌ API Error on one or more components.")
+              print(f"❌ API Error: {res_p.status_code}")
