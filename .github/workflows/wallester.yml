@@ -1,10 +1,10 @@
-name: Wallester Final Fix & Debug
+name: Wallester Full Detail Reveal
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug-and-reveal:
+  reveal-card:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -15,70 +15,85 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Execute Deep Inspection
+      - name: Fetch and Format Card
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
+          from datetime import datetime
 
-          # 1. Setup Keys & Derive Public Key
+          # 1. Config
+          CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
+          BASE_URL = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}"
+          
+          # 2. Setup Auth & Keys
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
-              pub_pem = private_key.public_key().public_bytes(
-                  encoding=serialization.Encoding.PEM,
-                  format=serialization.PublicFormat.SubjectPublicKeyInfo
-              )
-              pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
           def get_headers():
               token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
-              return {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": str(uuid.uuid4())}
+              return {"Authorization": f"Bearer {token}", "X-Request-ID": str(uuid.uuid4()), "Accept": "application/json"}
 
-          # 2. Issue a NEW card to test the RSA handshake with Email 3DS
-          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
-          issue_body = {
-              "account_id": ACCOUNT_ID,
-              "type": "Virtual",
-              "currency_code": "EUR",
-              "public_key": pub_b64,
-              "3d_secure_settings": {
-                  "email": "goldenkumquats@gmail.com",
-                  "password": os.getenv("TDS_PASSWORD"),
-                  "out_of_band_enabled": False
-              }
-          }
-
-          print("🚀 Attempting Card Issuance...")
-          res = requests.post("https://api-frontend.wallester.com/v1/cards", json=issue_body, headers=get_headers())
-          
-          if res.status_code in [200, 201]:
-              data = res.json()
-              print(f"✅ Card Created: {data.get('card', {}).get('id')}")
-              
-              # Check for encrypted data
-              enc_data = data.get('encrypted_data')
-              if enc_data:
-                  print("🔐 Sensitive data found! Decrypting...")
+          def decrypt(enc_b64, label=None):
+              if not enc_b64: return None
+              try:
+                  # Try with the specified label (Wallester often requires 'CardNumber' or 'CVV')
+                  l_bytes = label.encode() if label else None
+                  return private_key.decrypt(
+                      base64.b64decode(enc_b64),
+                      padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=l_bytes)
+                  ).decode('utf-8')
+              except:
+                  # Fallback to no label
                   try:
-                      decrypted = private_key.decrypt(
-                          base64.b64decode(enc_data),
+                      return private_key.decrypt(
+                          base64.b64decode(enc_b64),
                           padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-                      )
-                      print(f"💎 DATA: {decrypted.decode('utf-8')}")
-                  except Exception as d_err:
-                      print(f"❌ Decryption failed: {d_err}")
+                      ).decode('utf-8')
+                  except: return None
+
+          # 3. Fetch Data
+          h = get_headers()
+          
+          # Get Metadata (for Expiry)
+          res_meta = requests.get(BASE_URL, headers=h)
+          # Get PAN
+          res_pan = requests.get(f"{BASE_URL}/encrypted-card-number", headers=h)
+          # Get CVV
+          res_cvv = requests.get(f"{BASE_URL}/encrypted-cvv2", headers=h)
+
+          # 4. Process and Format
+          print("\n" + "="*50)
+          if res_meta.status_code == 200 and res_pan.status_code == 200 and res_cvv.status_code == 200:
+              # Parse Expiry
+              # Wallester expiry is usually "2029-08-24T14:15:22Z"
+              raw_expiry = res_meta.json().get('card', {}).get('expiry_date', "")
+              try:
+                  dt = datetime.strptime(raw_expiry.split('T')[0], '%Y-%m-%d')
+                  exp_m, exp_y = dt.strftime('%m'), dt.strftime('%y')
+              except:
+                  exp_m, exp_y = "??", "??"
+
+              # Decrypt PAN and CVV
+              full_pan = decrypt(res_pan.json().get('encrypted_card_number'), "CardNumber")
+              cvv = decrypt(res_cvv.json().get('encrypted_cvv2'), "CVV")
+
+              if full_pan and cvv:
+                  print("✅ CARD DATA RETRIEVED SUCCESSFULLY")
+                  print(f"Number: {full_pan}")
+                  print(f"CVV:    {cvv}")
+                  print(f"Expiry: {exp_m}/{exp_y}")
+                  print("-" * 50)
+                  print(f"FULL:   {full_pan}|{exp_m}|{exp_y}|{cvv}")
               else:
-                  print("\n⚠️  STRUCTURE ANALYSIS:")
-                  print("The 'encrypted_data' field is MISSING from the response.")
-                  print("Current Keys in JSON:", list(data.keys()))
-                  print("\nPROBABLE CAUSE: Your API Key does not have 'Show Card Details' scope enabled.")
+                  print("❌ Decryption failed. Ensure RSA keys and labels match.")
           else:
-              print(f"❌ API Error: {res.text}")
+              print(f"❌ Error fetching components. PAN:{res_pan.status_code} CVV:{res_cvv.status_code}")
+          print("="*50 + "\n")
