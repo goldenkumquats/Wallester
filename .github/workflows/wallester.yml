@@ -1,38 +1,40 @@
-name: Wallester - Create and Reveal Card
+name: Wallester - Issue and Reveal
 on:
   workflow_dispatch:
 
 jobs:
-  manage-card:
+  reveal:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
-
-      - name: Execute Card Lifecycle
+      - name: Execute
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          # These should be updated to your specific Wallester account IDs
-          CUSTOMER_ID: "00000000-0000-0000-0000-000000000000"
-          PROGRAM_ID: "00000000-0000-0000-0000-000000000000"
+          TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid, re, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # 1. KEY SETUP
+          # 1. Configuration & Key Setup
+          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
+          API_URL = "https://api-frontend.wallester.com/v1/cards"
+          EMAIL = "goldenkumquats@gmail.com"
+
           try:
-              raw_key_bytes = base64.b64decode(os.getenv("B64_PRIVATE_KEY"))
+              b64_key = os.getenv("B64_PRIVATE_KEY", "")
+              raw_key_bytes = base64.b64decode(b64_key)
               private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
               
+              # Derive Public Key for decryption requests
               pub_pem = private_key.public_key().public_bytes(
                   encoding=serialization.Encoding.PEM,
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -41,56 +43,56 @@ jobs:
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          # 2. AUTHENTICATION HELPER
-          def get_headers():
-              token = jwt.encode(
-                  {'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, 
-                  private_key, 
-                  algorithm='RS256'
-              )
-              return {
-                  "Authorization": f"Bearer {token}",
-                  "X-Request-ID": str(uuid.uuid4()),
-                  "Content-Type": "application/json"
-              }
-
-          # 3. CREATE CARD
-          print("--- Step 1: Creating New Card ---")
-          create_payload = {
-              "customer_id": os.getenv("CUSTOMER_ID"),
-              "card_program_id": os.getenv("PROGRAM_ID"),
-              "type": "VIRTUAL"
-          }
-          
-          create_res = requests.post(
-              "https://api-frontend.wallester.com/v1/cards", 
-              headers=get_headers(), 
-              json=create_payload
+          # 2. Authentication & Headers
+          token = jwt.encode(
+              {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, 
+              private_key, 
+              algorithm="RS256"
           )
-          
-          if create_res.status_code != 201:
-              print(f"❌ Creation Failed: {create_res.text}")
-              sys.exit(1)
-          
-          card_data = create_res.json()
-          CARD_ID = card_data.get('id')
-          print(f"✅ Card Created Successfully. ID: {CARD_ID}")
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+              "X-Request-ID": str(uuid.uuid4())
+          }
 
-          # 4. FETCH ENCRYPTED DATA
-          print("\n--- Step 2: Retrieving Sensitive Data ---")
-          body = {"public_key": pub_b64}
-          
-          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=get_headers()).json()
-          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=get_headers(), json=body).json()
-          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=get_headers(), json=body).json()
+          # 3. Issue Virtual Card
+          body_issue = {
+              "account_id": ACCOUNT_ID,
+              "type": "Virtual",
+              "name": "Golden Kumquat Card",
+              "3d_secure_settings": {
+                  "email": EMAIL,
+                  "password": os.getenv("TDS_PASSWORD"),
+                  "out_of_band_enabled": True
+              },
+              "security": {
+                  "internet_purchase_enabled": True,
+                  "contactless_enabled": True,
+                  "withdrawal_enabled": True
+              }
+          }
 
-          # 5. DECRYPTION UTILITY
+          print(f"🚀 Issuing Card...")
+          res_issue = requests.post(url=API_URL, json=body_issue, headers=headers, timeout=15)
+          
+          if res_issue.status_code not in [200, 201]:
+              print(f"❌ Issuance Failed: {res_issue.text}"); sys.exit(1)
+          
+          CARD_ID = res_issue.json().get('id')
+          print(f"✅ Card Issued: {CARD_ID}")
+
+          # 4. API Calls for Sensitive Data
+          body_reveal = {"public_key": pub_b64}
+          
+          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers).json()
+          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body_reveal).json()
+          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body_reveal).json()
+
           def exhaustive_decrypt(data, possible_labels):
               if not data: return None
               clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', data)
               clean = "".join(clean.split())
               ciphertext = base64.b64decode(clean)
-              
               for mgf_alg in [hashes.SHA256(), hashes.SHA1()]:
                   for lbl in possible_labels:
                       try:
@@ -107,15 +109,15 @@ jobs:
                           continue
               return None
 
-          # 6. REVEAL
+          # 5. Decrypt & Final Output
           pan = exhaustive_decrypt(res_p.get('encrypted_card_number'), ["CardNumber"])
           cvv = exhaustive_decrypt(res_c.get('encrypted_cvv2'), ["CVV", "CVV2", "Cvv"])
 
           if pan and cvv:
               exp = res_m.get('card', {}).get('expiry_date', "2000-01-01")
               dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
-              print(f"\n✅ REVEAL SUCCESS\n{'='*40}")
+              print(f"\n✅ SUCCESS\n{'='*40}")
               print(f"RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
               print(f"{'='*40}")
           else:
-              print(f"❌ Decryption Error. PAN: {'Found' if pan else 'None'}, CVV: {'Found' if cvv else 'None'}")
+              print(f"❌ Partial Success. PAN: {pan}, CVV: {cvv}")
