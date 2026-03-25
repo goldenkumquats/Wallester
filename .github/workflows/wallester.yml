@@ -1,10 +1,10 @@
-name: Wallester Card Issuance HelloWorld
+name: Wallester Issue and Reveal Card
 
 on:
   workflow_dispatch:
 
 jobs:
-  issue-card:
+  issue-and-reveal:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -15,12 +15,11 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Issue Virtual Card
+      - name: Process Card
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          # New secret required for 3DS authentication
           TDS_PASSWORD: ${{ secrets.WALLESTER_3DS_PASSWORD }}
         run: |
           import os, time, jwt, requests, sys, base64, uuid
@@ -28,61 +27,69 @@ jobs:
 
           # 1. Configuration
           ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
-          API_URL = "https://api-frontend.wallester.com/v1/cards"
+          BASE_URL = "https://api-frontend.wallester.com/v1"
           EMAIL = "goldenkumquats@gmail.com"
 
-          # 2. Key Decoding
+          # 2. Key Setup
           try:
               b64_key = os.getenv("B64_PRIVATE_KEY", "")
               pem_data = base64.b64decode(b64_key).decode('utf-8').strip()
-              private_key = serialization.load_pem_private_key(
-                  pem_data.encode('utf-8'), 
-                  password=None
-              )
+              private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
           except Exception as e:
               print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          # 3. JWT Token
-          token = jwt.encode(
-              {"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, 
-              private_key, 
-              algorithm="RS256"
-          )
+          def get_token():
+              return jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
 
-          # 4. Request Construction
+          # 3. Step 1: Issue the Card
+          issue_url = f"{BASE_URL}/cards"
           headers = {
-              "Authorization": f"Bearer {token}",
+              "Authorization": f"Bearer {get_token()}",
               "Content-Type": "application/json",
               "X-Request-ID": str(uuid.uuid4())
           }
-          
           body = {
               "account_id": ACCOUNT_ID,
               "type": "Virtual",
               "name": "Golden Kumquat Card",
               "3d_secure_settings": {
                   "email": EMAIL,
-                  "password": os.getenv("TDS_PASSWORD"), # Added per API requirement
+                  "password": os.getenv("TDS_PASSWORD"),
                   "out_of_band_enabled": True
               },
-              "security": {
-                  "internet_purchase_enabled": True,
-                  "contactless_enabled": True,
-                  "withdrawal_enabled": True
-              }
+              "security": {"internet_purchase_enabled": True}
           }
 
-          print(f"🚀 Sending Request to: {API_URL}")
-          try:
-              response = requests.post(url=API_URL, json=body, headers=headers, timeout=15)
-              
-              if response.status_code in [200, 201]:
-                  print("✅ SUCCESS! Card has been issued.")
-                  print(f"Response: {response.json()}")
-              else:
-                  print(f"❌ FAILED with status {response.status_code}")
-                  print(f"Server Message: {response.text}")
-                  sys.exit(1)
-          except Exception as e:
-              print(f"❌ Connection Error: {e}")
+          print("🚀 Issuing new card...")
+          res_issue = requests.post(issue_url, json=body, headers=headers, timeout=15)
+          
+          if res_issue.status_code not in [200, 201]:
+              print(f"❌ Issuance Failed: {res_issue.text}"); sys.exit(1)
+          
+          card_id = res_issue.json().get('card', {}).get('id')
+          print(f"✅ Card Issued! ID: {card_id}")
+
+          # 4. Step 2: Get Card Details (PAN/CVV)
+          # Per your request: GET /v1/cards/{id}/details
+          details_url = f"{BASE_URL}/cards/{card_id}/details"
+          
+          # We must generate a FRESH token because of the 5-second window
+          details_headers = {
+              "Authorization": f"Bearer {get_token()}",
+              "Content-Type": "application/json",
+              "X-Request-ID": str(uuid.uuid4())
+          }
+
+          print(f"🔍 Fetching details for card {card_id}...")
+          res_details = requests.get(details_url, headers=details_headers, timeout=15)
+
+          if res_details.status_code == 200:
+              print("\n" + "="*40)
+              print("💎 FULL CARD DETAILS RECEIVED")
+              # Note: If this is encrypted, it will look like a long string of random characters
+              print(res_details.json())
+              print("="*40)
+          else:
+              print(f"❌ Details Fetch Failed: {res_details.status_code}")
+              print(res_details.text)
               sys.exit(1)
