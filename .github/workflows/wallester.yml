@@ -1,10 +1,10 @@
-name: Wallester Reveal - Ultra Verbose Debug
+name: Wallester Reveal - PEM Wrapper Fix
 
 on:
   workflow_dispatch:
 
 jobs:
-  reveal-and-debug:
+  reveal-details:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -21,13 +21,13 @@ jobs:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid, json, binascii
+          import os, time, jwt, requests, sys, base64, uuid, json, re
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # --- 1. KEY INITIALIZATION ---
-          print("🛠️ [DEBUG] Loading Private Key...")
+          # --- 1. SETUP ---
+          print("🛠️ [STEP 1] Preparing RSA Keys...")
           try:
               pem_data = base64.b64decode(os.getenv("B64_PRIVATE_KEY")).decode('utf-8').strip()
               private_key = serialization.load_pem_private_key(pem_data.encode('utf-8'), password=None)
@@ -36,96 +36,76 @@ jobs:
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
               )
               pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
-              print("✅ Key loaded. Public key derived.")
           except Exception as e:
-              print(f"❌ Key Setup Error: {e}"); sys.exit(1)
+              print(f"❌ Key Error: {e}"); sys.exit(1)
 
-          def get_headers():
-              token = jwt.encode({"api_key": os.getenv("API_KEY"), "ts": int(time.time())}, private_key, algorithm="RS256")
-              return {
-                  "Authorization": f"Bearer {token}",
-                  "X-Request-ID": str(uuid.uuid4()),
-                  "Content-Type": "application/json"
-              }
-
-          def clean_and_decode(raw_str, field_name):
-              """Forces a string into a valid Base64 byte array."""
-              if not raw_str:
-                  print(f"   ⚠️ {field_name} is empty.")
-                  return None
+          def clean_pem_payload(raw_data, label_name):
+              """Removes -----BEGIN...----- wrappers and whitespace."""
+              if not raw_data: return None
+              print(f"\n📦 Cleaning {label_name} Payload...")
               
-              print(f"   🔍 Analyzing {field_name} (Length: {len(raw_str)})")
-              print(f"   🔍 Raw Start: {raw_str[:50]}...")
-
-              # Check for JWE / JWT dots
-              if "." in raw_str:
-                  parts = raw_str.split(".")
-                  print(f"   📍 Found {len(parts)} segments (JWE detected). Extracting segment 4 (ciphertext)...")
-                  raw_str = parts[3] if len(parts) > 3 else parts[0]
-
-              # Strip any whitespace/newlines
-              raw_str = raw_str.strip().replace("\n", "").replace("\r", "")
-
+              # Remove the Header/Footer lines and all whitespace/newlines
+              cleaned = re.sub(r'-----BEGIN.*?-----', '', raw_data)
+              cleaned = re.sub(r'-----END.*?-----', '', cleaned)
+              cleaned = "".join(cleaned.split()) # Removes \n, \r, spaces
+              
+              print(f"   Original Len: {len(raw_data)} | Cleaned Len: {len(cleaned)}")
+              
               # Fix Padding
-              missing_padding = len(raw_str) % 4
-              if missing_padding:
-                  print(f"   🔧 Adding {4 - missing_padding} padding characters.")
-                  raw_str += "=" * (4 - missing_padding)
-
+              pad_needed = len(cleaned) % 4
+              if pad_needed:
+                  cleaned += "=" * (4 - pad_needed)
+              
               try:
-                  return base64.b64decode(raw_str)
+                  return base64.b64decode(cleaned)
               except Exception as e:
-                  print(f"   ❌ Base64 Decode Failed for {field_name}: {e}")
+                  print(f"   ❌ Base64 Error: {e}")
                   return None
 
-          def multi_decrypt(enc_str, label_str):
-              ciphertext = clean_and_decode(enc_str, label_str)
-              if not ciphertext: return None
-              
-              print(f"   🔐 Attempting decryption permutations for {label_str}...")
-              # Permutation Matrix: SHA-256 vs SHA-1 | Label vs No Label
+          def decrypt_brute(encrypted_bytes, label_str):
+              if not encrypted_bytes: return None
+              # Matrix: Try SHA-256 (standard) and SHA-1 (legacy HSM)
               for h_alg in [hashes.SHA256(), hashes.SHA1()]:
                   for lbl in [label_str.encode(), None]:
                       try:
-                          decrypted = private_key.decrypt(
-                              ciphertext,
+                          return private_key.decrypt(
+                              encrypted_bytes,
                               padding.OAEP(mgf=padding.MGF1(algorithm=h_alg), algorithm=h_alg, label=lbl)
-                          )
-                          print(f"   ✅ Success with {h_alg.name} and Label:{lbl is not None}")
-                          return decrypted.decode('utf-8')
+                          ).decode('utf-8')
                       except: continue
               return None
 
-          # --- 2. API CALLS ---
+          # --- 2. API EXECUTION ---
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
-          headers = get_headers()
-          body = {"public_key": pub_b64}
+          headers = {
+              "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
+              "X-Request-ID": str(uuid.uuid4()),
+              "Content-Type": "application/json"
+          }
+          payload = {"public_key": pub_b64}
 
-          print(f"\n📡 Requesting Metadata...")
           res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers)
-          
-          print(f"📡 Requesting PAN (POST)...")
-          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body)
-          
-          print(f"📡 Requesting CVV (POST)...")
-          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body)
+          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=payload)
+          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=payload)
 
-          # --- 3. FINAL PROCESSING ---
+          # --- 3. DECRYPT & FORMAT ---
           if res_p.status_code == 200 and res_c.status_code == 200:
-              # Get Expiry
+              # Expiry
               exp_iso = res_m.json().get('card', {}).get('expiry_date', "2000-01-01")
               dt = datetime.strptime(exp_iso.split('T')[0], '%Y-%m-%d')
               
-              print("\n--- DECRYPTION LOG ---")
-              pan = multi_decrypt(res_p.json().get('encrypted_card_number'), "CardNumber")
-              cvv = multi_decrypt(res_c.json().get('encrypted_cvv2'), "CVV")
+              # Decrypt
+              pan_bytes = clean_pem_payload(res_p.json().get('encrypted_card_number'), "PAN")
+              cvv_bytes = clean_pem_payload(res_c.json().get('encrypted_cvv2'), "CVV")
+              
+              pan = decrypt_brute(pan_bytes, "CardNumber")
+              cvv = decrypt_brute(cvv_bytes, "CVV")
 
               if pan and cvv:
                   print("\n" + "⭐" * 40)
                   print(f"RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
                   print("⭐" * 40)
               else:
-                  print("\n❌ Final Result: Decryption Failed. Check the logs above for specific padding/segment errors.")
+                  print("\n❌ Decryption Failed. Bytes were cleaned, but RSA padding/hash did not match.")
           else:
-              print(f"\n❌ API Error! PAN Status: {res_p.status_code}, CVV Status: {res_c.status_code}")
-              print(f"   PAN Body: {res_p.text}")
+              print(f"❌ API Error: {res_p.status_code} / {res_c.status_code}")
