@@ -1,12 +1,11 @@
-name: Wallester Diagnostic - Redacted Verbose Logging
+name: Wallester Final Reveal - Production Reference
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  reveal:
     runs-on: ubuntu-latest
-
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -16,438 +15,89 @@ jobs:
       - name: Install Dependencies
         run: pip install PyJWT cryptography requests
 
-      - name: Execute Redacted Diagnostics
+      - name: Execute
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
-          CARD_ID: d82d7c29-f599-4d39-83b0-0b1a9bf6fed7
+          CARD_ID: "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
         run: |
-          import os
-          import sys
-          import time
-          import json
-          import uuid
-          import base64
-          import re
-          import jwt
-          import requests
-
-          from datetime import datetime
+          import os, time, jwt, requests, sys, base64, uuid, re, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
+          from datetime import datetime
 
-          API_BASE = "https://api-frontend.wallester.com/v1"
-          CARD_ID = os.getenv("CARD_ID", "").strip()
+          # --- 1. KEY LOADING & FORMATTING ---
+          try:
+              # Decode the GitHub Secret (which is a B64 string of the PEM)
+              raw_key_bytes = base64.b64decode(os.getenv("B64_PRIVATE_KEY"))
+              private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
+              
+              # Derive Public Key in PEM format (SubjectPublicKeyInfo/PKCS#8)
+              pub_pem = private_key.public_key().public_bytes(
+                  encoding=serialization.Encoding.PEM,
+                  format=serialization.PublicFormat.SubjectPublicKeyInfo
+              ).decode('utf-8')
+              
+              # CRITICAL: Wallester expects Base64(PEM_STRING)
+              pub_b64_payload = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
+          except Exception as e:
+              print(f"❌ Key Setup Error: {e}"); sys.exit(1)
 
-          def banner(title):
-              print("\n" + "=" * 80)
-              print(title)
-              print("=" * 80)
-
-          def log(msg):
-              print(msg, flush=True)
-
-          def fail(stage, msg, exit_code=1):
-              banner(f"FAILURE AT STAGE: {stage}")
-              log(msg)
-              sys.exit(exit_code)
-
-          def redact(value, keep_start=4, keep_end=4):
-              if value is None:
-                  return "<none>"
-              value = str(value)
-              if len(value) <= keep_start + keep_end:
-                  return "<redacted>"
-              return value[:keep_start] + "..." + value[-keep_end:]
-
-          def safe_len(value):
-              try:
-                  return len(value)
-              except Exception:
+          # --- 2. API CONFIGURATION ---
+          CARD_ID = os.getenv("CARD_ID")
+          headers = {
+              "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
+              "X-Request-ID": str(uuid.uuid4()),
+              "Content-Type": "application/json"
+          }
+          body = {"public_key": pub_b64_payload}
+          
+          # --- 3. API DATA RETRIEVAL ---
+          def get_data(url, method="POST", payload=None):
+              res = requests.request(method, url, headers=headers, json=payload)
+              if res.status_code != 200:
+                  print(f"⚠️ Request Failed [{res.status_code}]: {res.text}")
                   return None
+              return res.json()
 
-          def safe_json(resp):
-              try:
-                  return resp.json(), None
-              except Exception as e:
-                  return None, f"{type(e).__name__}: {e}"
+          meta = get_data(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", "GET")
+          pan_data = get_data(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", "POST", body)
+          cvv_data = get_data(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", "POST", body)
 
-          def summarize_json_keys(obj):
-              if isinstance(obj, dict):
-                  return sorted(list(obj.keys()))
-              if isinstance(obj, list):
-                  return [f"<list:{len(obj)}>"]
-              return [f"<{type(obj).__name__}>"]
-
-          def print_env_diagnostics():
-              banner("STAGE 1: ENVIRONMENT CHECKS")
-              api_key = os.getenv("API_KEY")
-              b64_key = os.getenv("B64_PRIVATE_KEY")
-              log(f"[ENV] API_KEY present: {'yes' if api_key else 'no'}")
-              log(f"[ENV] API_KEY length: {safe_len(api_key)}")
-              log(f"[ENV] B64_PRIVATE_KEY present: {'yes' if b64_key else 'no'}")
-              log(f"[ENV] B64_PRIVATE_KEY length: {safe_len(b64_key)}")
-              log(f"[ENV] CARD_ID present: {'yes' if CARD_ID else 'no'}")
-              log(f"[ENV] CARD_ID: {redact(CARD_ID, 8, 8)}")
-
-              if not api_key:
-                  fail("ENVIRONMENT CHECKS", "Missing API_KEY secret")
-              if not b64_key:
-                  fail("ENVIRONMENT CHECKS", "Missing B64_PRIVATE_KEY secret")
-              if not CARD_ID:
-                  fail("ENVIRONMENT CHECKS", "Missing CARD_ID")
-
-          def load_keys():
-              banner("STAGE 2: KEY LOADING")
-              try:
-                  raw_b64 = os.getenv("B64_PRIVATE_KEY")
-                  log(f"[KEY] Attempting base64 decode of private key secret")
-                  raw_key_bytes = base64.b64decode(raw_b64)
-                  log(f"[KEY] Base64 decode succeeded")
-                  log(f"[KEY] Decoded private key byte length: {len(raw_key_bytes)}")
-
-                  log(f"[KEY] Attempting PEM private key load")
-                  private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
-                  log(f"[KEY] Private key loaded successfully")
-
-                  public_key = private_key.public_key()
-                  pub_pem = public_key.public_bytes(
-                      encoding=serialization.Encoding.PEM,
-                      format=serialization.PublicFormat.SubjectPublicKeyInfo
-                  ).decode("utf-8")
-                  pub_b64 = base64.b64encode(pub_pem.encode("utf-8")).decode("utf-8")
-
-                  log(f"[KEY] Public key derived successfully")
-                  log(f"[KEY] Public PEM length: {len(pub_pem)}")
-                  log(f"[KEY] Public PEM first line: {pub_pem.splitlines()[0] if pub_pem else '<empty>'}")
-                  log(f"[KEY] Public key base64 length: {len(pub_b64)}")
-
-                  return private_key, pub_b64
-
-              except Exception as e:
-                  fail("KEY LOADING", f"[KEY] Error while loading key material: {type(e).__name__}: {e}")
-
-          def build_headers(private_key):
-              banner("STAGE 3: JWT / HEADER CREATION")
-              try:
-                  claims = {
-                      "api_key": os.getenv("API_KEY"),
-                      "ts": int(time.time())
-                  }
-                  log(f"[JWT] Claims keys: {sorted(list(claims.keys()))}")
-                  log(f"[JWT] ts: {claims['ts']}")
-                  log(f"[JWT] api_key length: {len(claims['api_key']) if claims['api_key'] else None}")
-
-                  token = jwt.encode(claims, private_key, algorithm="RS256")
-                  log(f"[JWT] Token created successfully")
-                  log(f"[JWT] Token length: {len(token)}")
-
-                  request_id = str(uuid.uuid4())
-                  headers = {
-                      "Authorization": f"Bearer {token}",
-                      "X-Request-ID": request_id,
-                      "Content-Type": "application/json"
-                  }
-
-                  log(f"[HDR] X-Request-ID: {request_id}")
-                  log(f"[HDR] Content-Type: {headers['Content-Type']}")
-                  log(f"[HDR] Authorization set: yes")
-                  log(f"[HDR] Authorization preview: Bearer <redacted:{len(token)} chars>")
-
-                  return headers
-
-              except Exception as e:
-                  fail("JWT / HEADER CREATION", f"[JWT] Failed to build headers: {type(e).__name__}: {e}")
-
-          def request_json(method, path, headers, json_body=None):
-              url = f"{API_BASE}{path}"
-              banner(f"HTTP REQUEST: {method} {path}")
-
-              log(f"[HTTP] URL: {url}")
-              log(f"[HTTP] Method: {method}")
-              log(f"[HTTP] X-Request-ID: {headers.get('X-Request-ID')}")
-              log(f"[HTTP] Content-Type: {headers.get('Content-Type')}")
-              log(f"[HTTP] Authorization present: {'yes' if headers.get('Authorization') else 'no'}")
-              log(f"[HTTP] Authorization: Bearer <redacted>")
-
-              if json_body is None:
-                  log("[HTTP] Request body: <none>")
-              else:
-                  log(f"[HTTP] Request JSON keys: {sorted(list(json_body.keys()))}")
-                  for k, v in json_body.items():
-                      if isinstance(v, str):
-                          log(f"[HTTP] Request field '{k}' length: {len(v)}")
-                      else:
-                          log(f"[HTTP] Request field '{k}' type: {type(v).__name__}")
-
-              try:
-                  if method == "GET":
-                      resp = requests.get(url, headers=headers, timeout=30)
-                  elif method == "POST":
-                      resp = requests.post(url, headers=headers, json=json_body, timeout=30)
-                  else:
-                      raise ValueError(f"Unsupported method: {method}")
-
-                  log(f"[HTTP] Response status: {resp.status_code}")
-                  log(f"[HTTP] Response headers content-type: {resp.headers.get('Content-Type')}")
-                  log(f"[HTTP] Response text length: {len(resp.text) if resp.text is not None else None}")
-                  log(f"[HTTP] Response ok: {resp.ok}")
-
-                  parsed, parse_err = safe_json(resp)
-                  if parse_err:
-                      log(f"[HTTP] JSON parse: failed")
-                      log(f"[HTTP] JSON parse error: {parse_err}")
-                      preview = resp.text[:500].replace("\n", "\\n") if resp.text else ""
-                      log(f"[HTTP] Response preview (first 500 chars): {preview}")
-                      return {
-                          "status_code": resp.status_code,
-                          "ok": resp.ok,
-                          "json_ok": False,
-                          "json": None,
-                          "json_keys": [],
-                          "text_preview": preview,
-                      }
-
-                  json_keys = summarize_json_keys(parsed)
-                  log(f"[HTTP] JSON parse: success")
-                  log(f"[HTTP] Top-level JSON keys: {json_keys}")
-
-                  if isinstance(parsed, dict):
-                      for k, v in parsed.items():
-                          if isinstance(v, str):
-                              log(f"[HTTP] Field '{k}' type=str length={len(v)}")
-                          elif isinstance(v, dict):
-                              log(f"[HTTP] Field '{k}' type=dict keys={sorted(list(v.keys()))}")
-                          elif isinstance(v, list):
-                              log(f"[HTTP] Field '{k}' type=list length={len(v)}")
-                          else:
-                              log(f"[HTTP] Field '{k}' type={type(v).__name__}")
-
-                  return {
-                      "status_code": resp.status_code,
-                      "ok": resp.ok,
-                      "json_ok": True,
-                      "json": parsed,
-                      "json_keys": json_keys,
-                      "text_preview": None,
-                  }
-
-              except Exception as e:
-                  log(f"[HTTP] Request exception: {type(e).__name__}: {e}")
-                  return {
-                      "status_code": None,
-                      "ok": False,
-                      "json_ok": False,
-                      "json": None,
-                      "json_keys": [],
-                      "text_preview": None,
-                      "exception": f"{type(e).__name__}: {e}",
-                  }
-
-          def exhaustive_decrypt_diagnostics(kind, data, possible_labels, private_key):
-              banner(f"DECRYPT DIAGNOSTICS: {kind}")
-
-              result = {
-                  "input_present": data is not None,
-                  "input_length": len(data) if isinstance(data, str) else None,
-                  "base64_decode_ok": False,
-                  "ciphertext_length": None,
-                  "attempts": [],
-                  "success": False,
-                  "selected_label": None,
-                  "selected_mgf": None,
-                  "selected_plaintext_length": None,
-                  "failure_summary": None,
-              }
-
-              log(f"[DEC:{kind}] Input present: {result['input_present']}")
-              log(f"[DEC:{kind}] Input type: {type(data).__name__}")
-              log(f"[DEC:{kind}] Input length: {result['input_length']}")
-
-              if not data:
-                  result["failure_summary"] = "missing or empty encrypted field"
-                  log(f"[DEC:{kind}] No input provided")
-                  return result
-
-              try:
-                  clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', data)
-                  clean = "".join(clean.split())
-                  log(f"[DEC:{kind}] Cleaned payload length: {len(clean)}")
-
-                  ciphertext = base64.b64decode(clean)
-                  result["base64_decode_ok"] = True
-                  result["ciphertext_length"] = len(ciphertext)
-                  log(f"[DEC:{kind}] Base64 decode: success")
-                  log(f"[DEC:{kind}] Ciphertext byte length: {len(ciphertext)}")
-              except Exception as e:
-                  result["failure_summary"] = f"base64 decode failed: {type(e).__name__}: {e}"
-                  log(f"[DEC:{kind}] Base64 decode: failed")
-                  log(f"[DEC:{kind}] Error: {type(e).__name__}: {e}")
-                  return result
-
+          # --- 4. DECRYPTION LOGIC ---
+          def decrypt_value(encrypted_text, label):
+              if not encrypted_text: return None
+              # Strip headers/newlines and decode Base64
+              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', encrypted_text)
+              ciphertext = base64.b64decode("".join(clean.split()))
+              
+              # Try SHA-256 (MGF1 SHA-256) first as it's the confirmed working config
+              # Fallback to SHA-1 MGF1 if needed
               for mgf_alg in [hashes.SHA256(), hashes.SHA1()]:
-                  mgf_name = type(mgf_alg).__name__
-                  for lbl in possible_labels:
-                      attempt = {
-                          "label": lbl,
-                          "mgf": mgf_name,
-                          "decrypt_ok": False,
-                          "utf8_ok": False,
-                          "error": None,
-                      }
-                      log(f"[DEC:{kind}] Attempt -> label='{lbl}', mgf='{mgf_name}', oaep_hash='SHA256'")
-
-                      try:
-                          decrypted = private_key.decrypt(
-                              ciphertext,
-                              padding.OAEP(
-                                  mgf=padding.MGF1(algorithm=mgf_alg),
-                                  algorithm=hashes.SHA256(),
-                                  label=lbl.encode()
-                              )
+                  try:
+                      return private_key.decrypt(
+                          ciphertext,
+                          padding.OAEP(
+                              mgf=padding.MGF1(algorithm=mgf_alg),
+                              algorithm=hashes.SHA256(),
+                              label=label.encode()
                           )
-                          attempt["decrypt_ok"] = True
-                          log(f"[DEC:{kind}] RSA decrypt: success for label='{lbl}', mgf='{mgf_name}'")
+                      ).decode('utf-8')
+                  except:
+                      continue
+              return None
 
-                          try:
-                              text = decrypted.decode("utf-8")
-                              attempt["utf8_ok"] = True
-                              result["success"] = True
-                              result["selected_label"] = lbl
-                              result["selected_mgf"] = mgf_name
-                              result["selected_plaintext_length"] = len(text)
-                              log(f"[DEC:{kind}] UTF-8 decode: success")
-                              log(f"[DEC:{kind}] Plaintext length: {len(text)}")
-                              result["attempts"].append(attempt)
-                              return result
-                          except Exception as e:
-                              attempt["error"] = f"utf8 decode failed: {type(e).__name__}: {e}"
-                              log(f"[DEC:{kind}] UTF-8 decode: failed -> {type(e).__name__}: {e}")
+          # --- 5. FINAL ASSEMBLY ---
+          pan = decrypt_value(pan_data.get('encrypted_card_number') if pan_data else None, "CardNumber")
+          cvv = decrypt_value(cvv_data.get('encrypted_cvv2') if cvv_data else None, "CVV2")
 
-                      except Exception as e:
-                          attempt["error"] = f"decrypt failed: {type(e).__name__}: {e}"
-                          log(f"[DEC:{kind}] RSA decrypt: failed -> {type(e).__name__}: {e}")
-
-                      result["attempts"].append(attempt)
-
-              result["failure_summary"] = "all OAEP parameter attempts failed"
-              log(f"[DEC:{kind}] Exhausted all candidate labels / MGF combinations without success")
-              return result
-
-          def main():
-              print_env_diagnostics()
-              private_key, pub_b64 = load_keys()
-              headers = build_headers(private_key)
-
-              body = {"public_key": pub_b64}
-
-              meta = request_json("GET", f"/cards/{CARD_ID}", headers)
-              pan_resp = request_json("POST", f"/cards/{CARD_ID}/encrypted-card-number", headers, body)
-              cvv_resp = request_json("POST", f"/cards/{CARD_ID}/encrypted-cvv2", headers, body)
-
-              banner("STAGE 4: RESPONSE SHAPE VALIDATION")
-
-              meta_json = meta.get("json") if meta.get("json_ok") else {}
-              pan_json = pan_resp.get("json") if pan_resp.get("json_ok") else {}
-              cvv_json = cvv_resp.get("json") if cvv_resp.get("json_ok") else {}
-
-              expiry = None
-              encrypted_pan = None
-              encrypted_cvv = None
-
-              if isinstance(meta_json, dict):
-                  expiry = meta_json.get("card", {}).get("expiry_date") if isinstance(meta_json.get("card"), dict) else None
-              if isinstance(pan_json, dict):
-                  encrypted_pan = pan_json.get("encrypted_card_number")
-              if isinstance(cvv_json, dict):
-                  encrypted_cvv = cvv_json.get("encrypted_cvv2")
-
-              log(f"[VAL] expiry_date present: {'yes' if expiry else 'no'}")
-              log(f"[VAL] encrypted_card_number present: {'yes' if encrypted_pan else 'no'}")
-              log(f"[VAL] encrypted_cvv2 present: {'yes' if encrypted_cvv else 'no'}")
-
-              if expiry:
-                  log(f"[VAL] expiry_date raw value: {expiry}")
-
-              pan_diag = exhaustive_decrypt_diagnostics("PAN", encrypted_pan, ["CardNumber"], private_key)
-              cvv_diag = exhaustive_decrypt_diagnostics("CVV", encrypted_cvv, ["CVV", "CVV2", "Cvv"], private_key)
-
-              banner("FINAL SUMMARY")
-
-              def status_word(v):
-                  return "SUCCESS" if v else "FAILED"
-
-              log("[SUMMARY] Environment")
-              log(f"  - API_KEY present: {'yes' if os.getenv('API_KEY') else 'no'}")
-              log(f"  - B64_PRIVATE_KEY present: {'yes' if os.getenv('B64_PRIVATE_KEY') else 'no'}")
-              log(f"  - CARD_ID present: {'yes' if CARD_ID else 'no'}")
-
-              log("[SUMMARY] HTTP")
-              log(f"  - Metadata call status: {meta.get('status_code')} | json_ok={meta.get('json_ok')} | ok={meta.get('ok')}")
-              log(f"  - Encrypted PAN call status: {pan_resp.get('status_code')} | json_ok={pan_resp.get('json_ok')} | ok={pan_resp.get('ok')}")
-              log(f"  - Encrypted CVV call status: {cvv_resp.get('status_code')} | json_ok={cvv_resp.get('json_ok')} | ok={cvv_resp.get('ok')}")
-
-              log("[SUMMARY] Expected fields")
-              log(f"  - expiry_date present: {'yes' if expiry else 'no'}")
-              log(f"  - encrypted_card_number present: {'yes' if encrypted_pan else 'no'}")
-              log(f"  - encrypted_cvv2 present: {'yes' if encrypted_cvv else 'no'}")
-
-              log("[SUMMARY] Decryption diagnostics")
-              log(f"  - PAN input present: {pan_diag['input_present']}")
-              log(f"  - PAN base64 decode ok: {pan_diag['base64_decode_ok']}")
-              log(f"  - PAN success: {pan_diag['success']}")
-              log(f"  - PAN selected label: {pan_diag['selected_label']}")
-              log(f"  - PAN selected mgf: {pan_diag['selected_mgf']}")
-              log(f"  - PAN failure summary: {pan_diag['failure_summary']}")
-
-              log(f"  - CVV input present: {cvv_diag['input_present']}")
-              log(f"  - CVV base64 decode ok: {cvv_diag['base64_decode_ok']}")
-              log(f"  - CVV success: {cvv_diag['success']}")
-              log(f"  - CVV selected label: {cvv_diag['selected_label']}")
-              log(f"  - CVV selected mgf: {cvv_diag['selected_mgf']}")
-              log(f"  - CVV failure summary: {cvv_diag['failure_summary']}")
-
-              banner("OPERATOR DIAGNOSIS")
-
-              if not meta.get("ok"):
-                  log("Metadata request failed. Check API auth, permissions, card ID, and endpoint availability.")
-              elif not pan_resp.get("ok"):
-                  log("Encrypted PAN request failed. The problem is in retrieval, not local PAN decryption.")
-              elif not cvv_resp.get("ok"):
-                  log("Encrypted CVV request failed. The problem is in retrieval, not local CVV decryption.")
-              elif not encrypted_pan:
-                  log("Encrypted PAN field missing from otherwise parseable response.")
-              elif not encrypted_cvv:
-                  log("Encrypted CVV field missing from otherwise parseable response.")
-              elif pan_diag["success"] and cvv_diag["success"]:
-                  log("All stages completed successfully at the diagnostic level.")
-                  log("Sensitive values are intentionally not printed by this workflow.")
-              elif pan_diag["success"] and not cvv_diag["success"]:
-                  log("PAN decryption parameters matched, but CVV decryption parameters did not.")
-                  log("Likely causes: different OAEP label, different padding assumptions, or incompatible ciphertext.")
-              elif not pan_diag["success"] and cvv_diag["success"]:
-                  log("CVV decryption parameters matched, but PAN decryption parameters did not.")
-              else:
-                  log("Both decryption paths failed after retrieval succeeded.")
-                  log("Likely causes: wrong private key, unexpected server-side encryption parameters, malformed ciphertext, or response/schema mismatch.")
-
-              banner("EXIT DECISION")
-
-              all_http_ok = bool(meta.get("ok")) and bool(pan_resp.get("ok")) and bool(cvv_resp.get("ok"))
-              all_fields_present = bool(expiry) and bool(encrypted_pan) and bool(encrypted_cvv)
-              all_dec_ok = bool(pan_diag["success"]) and bool(cvv_diag["success"])
-
-              log(f"[EXIT] all_http_ok={all_http_ok}")
-              log(f"[EXIT] all_fields_present={all_fields_present}")
-              log(f"[EXIT] all_dec_ok={all_dec_ok}")
-
-              if all_http_ok and all_fields_present and all_dec_ok:
-                  log("[EXIT] Workflow completed successfully in redacted diagnostic mode")
-                  sys.exit(0)
-              else:
-                  log("[EXIT] Workflow completed with failures. Review the stage logs above.")
-                  sys.exit(1)
-
-          if __name__ == "__main__":
-              main()
+          if pan and cvv:
+              exp_raw = meta.get('card', {}).get('expiry_date', "2000-01-01")
+              dt = datetime.strptime(exp_raw.split('T')[0], '%Y-%m-%d')
+              print(f"\n✅ SUCCESS\n{'='*40}")
+              print(f"RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+              print(f"{'='*40}")
+          else:
+              print("❌ Decryption failed. Verify private key and card status.")
+              sys.exit(1)
