@@ -48,10 +48,15 @@ jobs:
               print(f"❌ Base64 Decode Failed: {e}")
               sys.exit(1)
 
-          # 2. Prepare JWT Payload
+          # 2. Prepare Standard Financial JWT Claims
+          now = int(time.time())
           payload = {
               "api_key": api_key,
-              "ts": int(time.time())
+              "ts": now,
+              "iss": api_key,          # Issuer
+              "exp": now + 30,         # 30 second window
+              "aud": "wallester.com",  # Standard Audience
+              "sub": "api-request"     # Subject
           }
 
           # 3. Sign the JWT
@@ -61,13 +66,13 @@ jobs:
               print(f"❌ Signing Failed: {e}")
               sys.exit(1)
 
-          # 4. API Request - TRY SANDBOX FIRST
-          url = "https://api-sandbox.wallester.com/v1/cards"
+          # 4. API Request - BACK TO PRODUCTION
+          url = "https://api.wallester.com/v1/cards"
           
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Wallester-Integration/1.0"
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           }
           
           body = {
@@ -84,12 +89,5 @@ jobs:
               print(response.json())
           else:
               print(f"❌ Failed. Status: {response.status_code}")
-              print(f"Response Header: {response.headers.get('Content-Type')}")
               print(f"Response Body: {response.text}")
-              
-              if response.status_code == 403:
-                  print("\n💡 Troubleshooting 403:")
-                  print("1. Check if your API Key is for SANDBOX or PRODUCTION.")
-                  print("2. Ensure your account is fully verified in the portal.")
-                  print("3. Contact Wallester support to confirm your API key has 'Create Card' permissions.")
               sys.exit(1)
