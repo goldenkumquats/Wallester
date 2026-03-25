@@ -30,49 +30,44 @@ jobs:
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
         run: |
-          import os
-          import time
-          import jwt
-          import requests
-          import base64
-          import sys
+          import os, time, jwt, requests, base64, sys
 
-          # 1. Load and Decode Secret
+          # 1. Load and Decode Private Key
           api_key = os.getenv("API_KEY")
           b64_key = os.getenv("B64_PRIVATE_KEY")
           account_id = os.getenv("ACCOUNT_ID")
 
           try:
+              # Decoding the Base64 version of your 'example_private' file
               private_key_pem = base64.b64decode(b64_key).decode('utf-8')
           except Exception as e:
-              print(f"❌ Base64 Decode Failed: {e}")
+              print(f"❌ Key Decode Failed: {e}")
               sys.exit(1)
 
-          # 2. Prepare Standard Financial JWT Claims
-          now = int(time.time())
+          # 2. Create Claims EXACTLY as per your documentation
+          # Headers for the JWT (Standard for RS256)
+          headers = {"alg": "RS256", "typ": "JWT"}
+          
           payload = {
               "api_key": api_key,
-              "ts": now,
-              "iss": api_key,          # Issuer
-              "exp": now + 30,         # 30 second window
-              "aud": "wallester.com",  # Standard Audience
-              "sub": "api-request"     # Subject
+              "ts": int(time.time())
           }
 
           # 3. Sign the JWT
           try:
-              token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+              token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers=headers)
           except Exception as e:
               print(f"❌ Signing Failed: {e}")
               sys.exit(1)
 
-          # 4. API Request - BACK TO PRODUCTION
+          # 4. API Request
           url = "https://api.wallester.com/v1/cards"
           
-          headers = {
+          # Adding a common User-Agent to bypass OpenResty 403 firewall
+          request_headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Wallester-Integration/1.0"
           }
           
           body = {
@@ -81,8 +76,8 @@ jobs:
               "currency_code": "EUR"
           }
 
-          print(f"🚀 Sending request to: {url}")
-          response = requests.post(url, json=body, headers=headers)
+          print(f"🚀 Sending request for Account: {account_id}...")
+          response = requests.post(url, json=body, headers=request_headers)
 
           if response.status_code in [200, 201]:
               print("✅ Success! Card Created.")
@@ -90,4 +85,7 @@ jobs:
           else:
               print(f"❌ Failed. Status: {response.status_code}")
               print(f"Response Body: {response.text}")
+              
+              if response.status_code == 403:
+                  print("\n💡 Note: If code is correct, check Wallester portal for 'KYB Verification' status.")
               sys.exit(1)
