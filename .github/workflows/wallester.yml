@@ -1,4 +1,4 @@
-name: Wallester - Create and Reveal (Schema Match)
+name: Wallester - Create and Reveal (Final Success)
 
 on:
   workflow_dispatch:
@@ -21,22 +21,25 @@ jobs:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           PROFILE_ID: ${{ secrets.WALLESTER_PROFILE_ID }}
+          # Use your specific Account ID
+          ACCOUNT_ID: "06691820-662d-43e9-9ac3-29b61d1476d7" 
         run: |
           import os, time, jwt, requests, sys, base64, uuid, re, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
           from datetime import datetime
 
-          # --- 1. KEY SETUP ---
+          # --- 1. KEY SETUP (Double-Wrapped for Wallester) ---
           b64_str = os.getenv("B64_PRIVATE_KEY").strip()
           private_key = serialization.load_pem_private_key(base64.b64decode(b64_str), password=None)
           pub_pem = private_key.public_key().public_bytes(
               encoding=serialization.Encoding.PEM,
               format=serialization.PublicFormat.SubjectPublicKeyInfo
           ).decode('utf-8')
+          # This matches the B64(PEM) format Wallester expects
           pub_b64 = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
 
-          # --- 2. AUTH ---
+          # --- 2. AUTH HELPERS ---
           def get_headers():
               return {
                   "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY').strip(), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
@@ -44,34 +47,33 @@ jobs:
                   "Content-Type": "application/json"
               }
 
-          # --- 3. CREATE NEW CARD (SCHEMA MATCH) ---
-          ACCOUNT_ID = "06691820-662d-43e9-9ac3-29b61d1476d7"
-          PROFILE_ID = os.getenv("PROFILE_ID").strip()
-
-          # Matching the sample schema precisely
+          # --- 3. CREATE CARD WITH 3DS SETTINGS ---
+          # 3DS is MANDATORY for Virtual card creation
           create_payload = {
-              "account_id": ACCOUNT_ID,
-              "card_metadata_profile_id": PROFILE_ID,
-              "type": "Virtual",      # Casing matched to sample
-              "is_disposable": True,   # Added based on sample properties
-              "public_key": pub_b64
+              "account_id": os.getenv("ACCOUNT_ID"),
+              "card_metadata_profile_id": os.getenv("PROFILE_ID").strip(),
+              "type": "Virtual",
+              "public_key": pub_b64,
+              "card_3d_secure_settings": {
+                  "email": "security@example.com",
+                  "mobile": "+1234567890"
+              }
           }
 
-          print(f"📡 Sending request with type: {create_payload['type']}")
+          print(f"📡 Issuing Virtual Card for Account: {create_payload['account_id']}")
           res = requests.post("https://api-frontend.wallester.com/v1/cards", 
                              headers=get_headers(), json=create_payload)
 
           if not res.ok:
-              print(f"❌ Creation Failed: {res.status_code}")
-              print(f"DEBUG RESPONSE: {res.text}")
+              print(f"❌ Creation Failed: {res.status_code}\n{res.text}")
               sys.exit(1)
 
           card_data = res.json()['card']
           CARD_ID = card_data['id']
-          print(f"✅ Success! Card ID: {CARD_ID}")
+          print(f"✅ Card Created: {CARD_ID}")
 
-          # --- 4. REVEAL & DECRYPT ---
-          def reveal(endpoint, label):
+          # --- 4. EXHAUSTIVE DECRYPTION (CVV FIX) ---
+          def decrypt_field(endpoint, label_list):
               url = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/{endpoint}"
               resp = requests.post(url, headers=get_headers(), json={"public_key": pub_b64})
               if not resp.ok: return None
@@ -80,14 +82,30 @@ jobs:
               clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', val)
               ciphertext = base64.b64decode("".join(clean.split()))
               
-              return private_key.decrypt(
-                  ciphertext,
-                  padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=label.encode())
-              ).decode('utf-8')
+              # Try both SHA256 and SHA1 for MGF1 to handle HSM variation
+              for mgf_alg in [hashes.SHA256(), hashes.SHA1()]:
+                  for label in label_list:
+                      try:
+                          return private_key.decrypt(
+                              ciphertext,
+                              padding.OAEP(
+                                  mgf=padding.MGF1(algorithm=mgf_alg),
+                                  algorithm=hashes.SHA256(),
+                                  label=label.encode()
+                              )
+                          ).decode('utf-8')
+                      except:
+                          continue
+              return None
 
-          pan = reveal("encrypted-card-number", "CardNumber")
-          cvv = reveal("encrypted-cvv2", "CVV2")
+          # PAN uses "CardNumber" label
+          pan = decrypt_field("encrypted-card-number", ["CardNumber"])
+          # CVV uses "CVV2" or "CVV" label
+          cvv = decrypt_field("encrypted-cvv2", ["CVV2", "CVV", "Cvv"])
 
           if pan and cvv:
               dt = datetime.strptime(card_data['expiry_date'].split('T')[0], '%Y-%m-%d')
-              print(f"\n✨ NEW CARD CREATED:\n{pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+              print(f"\n✨ SUCCESS: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
+          else:
+              print(f"❌ Decryption failed. PAN: {pan}, CVV: {cvv}")
+              sys.exit(1)
