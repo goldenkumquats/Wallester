@@ -6,6 +6,7 @@ on:
       account_id:
         description: 'The UUID of the Wallester Account'
         required: true
+        default: '06691820-662d-43e9-9ac3-29b61d1476d7'
 
 jobs:
   issue-virtual-card:
@@ -26,7 +27,6 @@ jobs:
         shell: python
         env:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
-          # This is now the Base64 string
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
           ACCOUNT_ID: ${{ github.event.inputs.account_id }}
         run: |
@@ -43,7 +43,6 @@ jobs:
           account_id = os.getenv("ACCOUNT_ID")
 
           try:
-              # Decode Base64 back to the original PEM format
               private_key_pem = base64.b64decode(b64_key).decode('utf-8')
           except Exception as e:
               print(f"❌ Base64 Decode Failed: {e}")
@@ -57,26 +56,27 @@ jobs:
 
           # 3. Sign the JWT
           try:
-              # RS256 requires the private key
               token = jwt.encode(payload, private_key_pem, algorithm="RS256")
           except Exception as e:
               print(f"❌ Signing Failed: {e}")
-              print("Check if the secret starts with -----BEGIN RSA PRIVATE KEY-----")
               sys.exit(1)
 
-          # 4. API Request
-          url = "https://api.wallester.com/v1/cards"
+          # 4. API Request - TRY SANDBOX FIRST
+          url = "https://api-sandbox.wallester.com/v1/cards"
+          
           headers = {
               "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json"
+              "Content-Type": "application/json",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Wallester-Integration/1.0"
           }
+          
           body = {
               "account_id": account_id,
               "type": "Virtual",
               "currency_code": "EUR"
           }
 
-          print(f"🚀 Sending request for Account: {account_id}...")
+          print(f"🚀 Sending request to: {url}")
           response = requests.post(url, json=body, headers=headers)
 
           if response.status_code in [200, 201]:
@@ -84,5 +84,12 @@ jobs:
               print(response.json())
           else:
               print(f"❌ Failed. Status: {response.status_code}")
-              print(f"Response: {response.text}")
+              print(f"Response Header: {response.headers.get('Content-Type')}")
+              print(f"Response Body: {response.text}")
+              
+              if response.status_code == 403:
+                  print("\n💡 Troubleshooting 403:")
+                  print("1. Check if your API Key is for SANDBOX or PRODUCTION.")
+                  print("2. Ensure your account is fully verified in the portal.")
+                  print("3. Contact Wallester support to confirm your API key has 'Create Card' permissions.")
               sys.exit(1)
