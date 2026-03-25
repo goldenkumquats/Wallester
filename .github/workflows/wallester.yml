@@ -1,10 +1,10 @@
-name: Wallester Final Reveal - Multi-Hash Verbose
+name: Wallester Ultra-Verbose Debugger
 
 on:
   workflow_dispatch:
 
 jobs:
-  reveal:
+  debug-reveal:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
@@ -21,79 +21,75 @@ jobs:
           API_KEY: ${{ secrets.WALLESTER_API_KEY }}
           B64_PRIVATE_KEY: ${{ secrets.WALLESTER_PRIVATE_KEY }}
         run: |
-          import os, time, jwt, requests, sys, base64, uuid, re
+          import os, time, jwt, requests, sys, base64, uuid, re, json
           from cryptography.hazmat.primitives import serialization, hashes
           from cryptography.hazmat.primitives.asymmetric import padding
-          from datetime import datetime
 
-          print("🛠️ [STEP 1] Decoding and Loading Private Key...")
+          # --- 1. KEY LOADING ---
+          print("🛠️ [DEBUG] Loading Private Key...")
           try:
-              # Explicitly decode the Base64 Secret first
-              decoded_key_bytes = base64.b64decode(os.getenv("B64_PRIVATE_KEY"))
-              # Load the PEM (This handles both PKCS#1 and PKCS#8)
-              private_key = serialization.load_pem_private_key(decoded_key_bytes, password=None)
+              # Decode the base64 secret
+              encoded_key = os.getenv("B64_PRIVATE_KEY")
+              raw_key_bytes = base64.b64decode(encoded_key)
+              private_key = serialization.load_pem_private_key(raw_key_bytes, password=None)
               
-              # Generate the Public Key PEM as requested by Wallester docs
+              # Export Public Key PEM
               pub_pem = private_key.public_key().public_bytes(
                   encoding=serialization.Encoding.PEM,
                   format=serialization.PublicFormat.SubjectPublicKeyInfo
               ).decode('utf-8')
               
-              # Double-encode: Base64 of the PEM string
+              # Wallester wants the Public Key string itself Base64 encoded
               pub_b64_payload = base64.b64encode(pub_pem.encode('utf-8')).decode('utf-8')
-              print("✅ Private key loaded. Public key payload prepared.")
+              print("✅ Key Loaded.")
           except Exception as e:
-              print(f"❌ Key Loading Error: {e}"); sys.exit(1)
+              print(f"❌ Key Loading Failed: {e}"); sys.exit(1)
 
-          def multi_attempt_decrypt(pem_str, label_str):
-              if not pem_str: return None
-              # 1. Strip PEM wrappers and join lines
-              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', pem_str)
-              clean = "".join(clean.split())
-              ciphertext = base64.b64decode(clean)
-              
-              # 2. Try the two most common Banking RSA-OAEP configurations
-              # Matrix: (Algorithm, MGF1_Algorithm)
-              configs = [
-                  (hashes.SHA256(), hashes.SHA1()),   # Most common for HSMs
-                  (hashes.SHA256(), hashes.SHA256()), # Modern standard
-              ]
-              
-              for alg, mgf in configs:
-                  try:
-                      print(f"   ⏳ Attempting {label_str} with {alg.name} / MGF1-{mgf.name}...")
-                      decrypted = private_key.decrypt(
-                          ciphertext,
-                          padding.OAEP(mgf=padding.MGF1(algorithm=mgf), algorithm=alg, label=label_str.encode())
-                      )
-                      return decrypted.decode('utf-8')
-                  except:
-                      continue
-              return None
-
-          # --- API EXECUTION ---
+          # --- 2. API CONFIG ---
           CARD_ID = "d82d7c29-f599-4d39-83b0-0b1a9bf6fed7"
           headers = {
               "Authorization": f"Bearer {jwt.encode({'api_key': os.getenv('API_KEY'), 'ts': int(time.time())}, private_key, algorithm='RS256')}",
               "X-Request-ID": str(uuid.uuid4()),
               "Content-Type": "application/json"
           }
-          
-          print(f"📡 Requesting components for card {CARD_ID}...")
           body = {"public_key": pub_b64_payload}
-          
-          res_m = requests.get(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}", headers=headers).json()
-          res_p = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number", headers=headers, json=body).json()
-          res_c = requests.post(f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-cvv2", headers=headers, json=body).json()
 
-          # --- DECRYPTION ---
-          pan = multi_attempt_decrypt(res_p.get('encrypted_card_number'), "CardNumber")
-          cvv = multi_attempt_decrypt(res_c.get('encrypted_cvv2'), "CVV")
+          print(f"\n📡 [SENDING TO WALLESTER]")
+          print(f"URL: https://api-frontend.wallester.com/v1/cards/{CARD_ID}/encrypted-card-number")
+          print(f"BODY: {json.dumps(body)[:150]}... (truncated)")
 
-          if pan and cvv:
-              exp = res_m.get('card', {}).get('expiry_date', "2000-01-01")
-              dt = datetime.strptime(exp.split('T')[0], '%Y-%m-%d')
-              print(f"\n⭐ RESULT: {pan}|{dt.strftime('%m')}|{dt.strftime('%y')}|{cvv}")
-          else:
-              print("\n❌ Decryption failed on all hash combinations.")
-              print(f"   DEBUG: PAN Header: {str(res_p.get('encrypted_card_number'))[:40]}...")
+          # --- 3. THE CALLS ---
+          def perform_call(endpoint, label):
+              url = f"https://api-frontend.wallester.com/v1/cards/{CARD_ID}/{endpoint}"
+              print(f"\n--- Requesting {label} ---")
+              response = requests.post(url, headers=headers, json=body)
+              print(f"Status Code: {response.status_code}")
+              print(f"Raw Response: {response.text}")
+              return response.json() if response.status_code == 200 else None
+
+          res_p = perform_call("encrypted-card-number", "PAN")
+          res_c = perform_call("encrypted-cvv2", "CVV")
+
+          # --- 4. DECRYPTION ATTEMPTS ---
+          def try_decrypt(data, label_str):
+              if not data: return
+              # Clean the PEM
+              clean = re.sub(r'-----BEGIN.*?-----|-----END.*?-----', '', data)
+              clean = "".join(clean.split())
+              ciphertext = base64.b64decode(clean)
+              
+              # Try combinations
+              for alg, mgf in [(hashes.SHA256(), hashes.SHA1()), (hashes.SHA256(), hashes.SHA256())]:
+                  try:
+                      print(f"🧪 Testing {alg.name}/{mgf.name} for {label_str}...")
+                      decrypted = private_key.decrypt(
+                          ciphertext,
+                          padding.OAEP(mgf=padding.MGF1(algorithm=mgf), algorithm=alg, label=label_str.encode())
+                      )
+                      print(f"✅ SUCCESS: {decrypted.decode('utf-8')}")
+                      return
+                  except Exception as e:
+                      print(f"   ❌ Failed: {str(e)}")
+
+          if res_p: try_decrypt(res_p.get('encrypted_card_number'), "CardNumber")
+          if res_c: try_decrypt(res_c.get('encrypted_cvv2'), "CVV")
